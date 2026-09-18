@@ -1,0 +1,9 @@
+# CMake build output and compiler artifacts
+/build/
+*.obj
+
+# Generated OCR experiment images
+/ocr_test/blackhat/
+/ocr_test/filters/
+/ocr_test/rows/
+/ocr_test/textonly/
