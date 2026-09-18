@@ -96,6 +96,28 @@ constexpr double kRangeMarkerBarLeftFraction = 0.369;
 constexpr double kRangeMarkerBarRightFraction = 0.407;
 constexpr double kRangeMarkerLabelGapFraction = 0.011;
 
+// The horizontal traverse ladder uses 15-degree reference marks. The 0/360
+// seam is circular, so the nearest reference is selected using a wrapped
+// angular distance rather than a linear range lookup.
+constexpr double kAngleStepDegrees = 15.0;
+constexpr double kFullCircleDegrees = 360.0;
+constexpr double kAngleReferenceValues[] = {
+    0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0,
+    120.0, 135.0, 150.0, 165.0, 180.0, 195.0, 210.0, 225.0,
+    240.0, 255.0, 270.0, 285.0, 300.0, 315.0, 330.0, 345.0};
+
+// Adjacent horizontal ladder labels are about 84 px apart in the 1920 px
+// wide mockup. The fraction keeps the guide proportional when the game window
+// is resized.
+constexpr double kAngleMarkerCenterFraction = 0.5;
+constexpr double kAngleLineSpacingFraction = 84.0 / 1920.0;
+
+// The vertical guide sits beneath the compass ladder, clear of the center
+// reticle and the range labels, matching the supplied mockup.
+constexpr double kAngleMarkerTopFraction = 0.312;
+constexpr double kAngleMarkerBottomFraction = 0.344;
+constexpr double kAngleMarkerLabelGapFraction = 0.005;
+
 struct Coordinate
 {
     double x{};
@@ -179,6 +201,33 @@ std::wstring FormatCoordinate(const Coordinate& coordinate)
            FormatNumber(coordinate.y, 3);
 }
 
+double NormalizeAngleDegrees(double angle)
+{
+    if (!std::isfinite(angle))
+    {
+        return angle;
+    }
+
+    angle = std::fmod(angle, kFullCircleDegrees);
+    if (angle < 0.0)
+    {
+        angle += kFullCircleDegrees;
+    }
+
+    return angle;
+}
+
+double SignedAngleDifferenceDegrees(double angle, double reference)
+{
+    double difference = NormalizeAngleDegrees(angle - reference);
+    if (difference > kFullCircleDegrees / 2.0)
+    {
+        difference -= kFullCircleDegrees;
+    }
+
+    return difference;
+}
+
 struct DirectionResult
 {
     double bearing{};
@@ -205,6 +254,67 @@ DirectionResult CalculateDirection(
 
     const int sector = static_cast<int>((bearing + 22.5) / 45.0) % 8;
     return DirectionResult{bearing, kCompassPoints[sector]};
+}
+
+std::optional<size_t> SelectNearestAngleReference(double targetBearing)
+{
+    if (!std::isfinite(targetBearing))
+    {
+        return std::nullopt;
+    }
+
+    const double normalizedBearing = NormalizeAngleDegrees(targetBearing);
+    size_t bestIndex = 0;
+    double bestDifference = std::abs(
+        SignedAngleDifferenceDegrees(normalizedBearing, kAngleReferenceValues[0]));
+
+    for (size_t index = 1; index < _countof(kAngleReferenceValues); ++index)
+    {
+        const double difference = std::abs(
+            SignedAngleDifferenceDegrees(
+                normalizedBearing, kAngleReferenceValues[index]));
+        // On an exact tie, keep the lower table entry. This also gives the
+        // 0-degree label a stable preference at the 360-degree seam.
+        if (difference < bestDifference)
+        {
+            bestDifference = difference;
+            bestIndex = index;
+        }
+    }
+
+    return bestIndex;
+}
+
+std::optional<double> NearestAngleReference(double targetBearing)
+{
+    const auto index = SelectNearestAngleReference(targetBearing);
+    if (!index.has_value())
+    {
+        return std::nullopt;
+    }
+
+    return kAngleReferenceValues[*index];
+}
+
+std::optional<double> CalculateAngleGuideFraction(double targetBearing)
+{
+    const auto reference = NearestAngleReference(targetBearing);
+    if (!reference.has_value())
+    {
+        return std::nullopt;
+    }
+
+    // Increasing compass angles run left-to-right on the horizontal ladder.
+    // Move the selected printed step in the opposite direction of the
+    // target's fractional offset so that the target angle lands at center.
+    const double relativeStep =
+        SignedAngleDifferenceDegrees(targetBearing, *reference) /
+        kAngleStepDegrees;
+    return std::clamp(
+        kAngleMarkerCenterFraction -
+            (relativeStep * kAngleLineSpacingFraction),
+        0.0,
+        1.0);
 }
 
 std::wstring FormatDirection(const DirectionResult& direction)
@@ -1607,8 +1717,8 @@ void PaintRangeOverlay(HWND window, HDC dc)
     RECT client{};
     GetClientRect(window, &client);
 
-    // The range overlay uses black as a color key, so everything except the
-    // guide and its label remains fully transparent over the game.
+    // The range/angle overlay uses black as a color key, so everything except
+    // the guides and their labels remains fully transparent over the game.
     HBRUSH transparentBackground = CreateSolidBrush(RGB(0, 0, 0));
     FillRect(dc, &client, transparentBackground);
     DeleteObject(transparentBackground);
@@ -1618,6 +1728,87 @@ void PaintRangeOverlay(HWND window, HDC dc)
     if (width <= 0 || height <= 0)
     {
         return;
+    }
+
+    if (g_app != nullptr && g_app->bearing.has_value())
+    {
+        const auto reference = NearestAngleReference(*g_app->bearing);
+        const auto guideFraction = CalculateAngleGuideFraction(*g_app->bearing);
+        if (reference.has_value() && guideFraction.has_value())
+        {
+            const int guideX = std::clamp(
+                static_cast<int>(std::lround(
+                    *guideFraction * static_cast<double>(width))),
+                0,
+                width - 1);
+            const int markerTop = std::clamp(
+                static_cast<int>(std::lround(
+                    height * kAngleMarkerTopFraction)),
+                0,
+                height - 1);
+            const int markerBottom = std::clamp(
+                static_cast<int>(std::lround(
+                    height * kAngleMarkerBottomFraction)),
+                markerTop,
+                height - 1);
+
+            HPEN anglePen = CreatePen(PS_SOLID, 3, RGB(255, 55, 55));
+            HPEN previousPen = static_cast<HPEN>(SelectObject(dc, anglePen));
+            MoveToEx(dc, guideX, markerTop, nullptr);
+            LineTo(dc, guideX, markerBottom);
+            SelectObject(dc, previousPen);
+            DeleteObject(anglePen);
+
+            const std::wstring label = FormatNumber(*reference, 0);
+            HFONT font = CreateFontW(
+                24,
+                0,
+                0,
+                0,
+                FW_SEMIBOLD,
+                FALSE,
+                FALSE,
+                FALSE,
+                DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE,
+                L"Segoe UI");
+            HFONT previousFont = static_cast<HFONT>(SelectObject(dc, font));
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, RGB(255, 55, 55));
+
+            SIZE labelSize{};
+            GetTextExtentPoint32W(
+                dc,
+                label.c_str(),
+                static_cast<int>(label.size()),
+                &labelSize);
+            const int labelWidth = static_cast<int>(labelSize.cx);
+            const int labelHeight = static_cast<int>(labelSize.cy);
+            const int maxLabelX = std::max(0, width - labelWidth);
+            const int labelX = std::clamp(
+                guideX - (labelWidth / 2),
+                0,
+                maxLabelX);
+            const int labelGap = std::max(
+                1,
+                static_cast<int>(std::lround(
+                    height * kAngleMarkerLabelGapFraction)));
+            const int labelY = std::min(
+                height - std::max(1, labelHeight),
+                markerBottom + labelGap);
+            TextOutW(
+                dc,
+                labelX,
+                std::max(0, labelY),
+                label.c_str(),
+                static_cast<int>(label.size()));
+
+            SelectObject(dc, previousFont);
+            DeleteObject(font);
+        }
     }
 
     const auto target = CurrentRangeTargetMeters();
