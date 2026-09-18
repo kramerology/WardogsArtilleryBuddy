@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <dwmapi.h>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -39,6 +40,7 @@
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "WindowsApp.lib")
+#pragma comment(lib, "Dwmapi.lib")
 
 namespace
 {
@@ -88,11 +90,11 @@ constexpr double kRangeMarkerCenterFraction = 0.5;
 // screenshots. Fractions keep the guide proportional when the game window is
 // resized.
 constexpr double kRangeLineSpacingFraction = 102.0 / 1080.0;
-// Keep the marker inside the left side of the reticle, with the selected
-// reference value to the right of its line, matching:  ─── 430
-constexpr double kRangeMarkerLabelXFraction = 0.426;
-constexpr double kRangeMarkerBarLeftFraction = 0.382;
-constexpr double kRangeMarkerBarRightFraction = 0.415;
+// Keep the marker inside the left side of the reticle. The left edge reaches
+// the ladder line, while the right edge leaves the label just to its right.
+constexpr double kRangeMarkerBarLeftFraction = 0.369;
+constexpr double kRangeMarkerBarRightFraction = 0.407;
+constexpr double kRangeMarkerLabelGapFraction = 0.011;
 
 struct Coordinate
 {
@@ -135,14 +137,9 @@ struct AppState
     HWND targetWindow{};
     DWORD targetProcessId{};
 
-    HWND statusLabel{};
-    HWND firstLabel{};
-    HWND secondLabel{};
-    HWND distanceLabel{};
-    HWND directionLabel{};
-    HWND overlayStateLabel{};
-    HWND rangeTargetLabel{};
     HWND rangeScaleEdit{};
+    HFONT uiFont{};
+    std::wstring status{L"Open the map, then capture player and target positions."};
 
     NOTIFYICONDATAW tray{};
 
@@ -288,19 +285,12 @@ std::optional<Coordinate> ParseOcrCoordinate(const std::wstring& text)
     return std::nullopt;
 }
 
-void SetControlText(HWND control, const std::wstring& text)
-{
-    if (control != nullptr)
-    {
-        SetWindowTextW(control, text.c_str());
-    }
-}
-
 void SetStatus(const std::wstring& message)
 {
     if (g_app != nullptr)
     {
-        SetControlText(g_app->statusLabel, message);
+        g_app->status = message;
+        InvalidateRect(g_app->mainWindow, nullptr, FALSE);
     }
 }
 
@@ -494,50 +484,10 @@ void UpdateDisplay()
         return;
     }
 
-    SetControlText(
-        g_app->firstLabel,
-        L"First coordinate: " +
-            (g_app->first.has_value() ? FormatCoordinate(*g_app->first)
-                                       : L"(not captured)"));
-
-    SetControlText(
-        g_app->secondLabel,
-        L"Second coordinate: " +
-            (g_app->second.has_value() ? FormatCoordinate(*g_app->second)
-                                        : L"(not captured)"));
-
-    SetControlText(
-        g_app->distanceLabel,
-        L"Distance: " +
-            (g_app->distance.has_value() ? FormatNumber(*g_app->distance, 2)
-                                          : L"(waiting for two coordinates)"));
-
-    SetControlText(
-        g_app->directionLabel,
-        L"Direction: " +
-            (g_app->bearing.has_value()
-                 ? FormatDirection(DirectionResult{*g_app->bearing,
-                                                    g_app->compassDirection.c_str()})
-                 : L"(waiting for two coordinates)"));
-
-    SetControlText(g_app->overlayStateLabel, OverlayStateText());
-    const auto targetRange = CurrentRangeTargetMeters();
-    std::optional<double> rangeReference;
-    if (targetRange.has_value())
-    {
-        rangeReference = NearestRangeReference(*targetRange);
-    }
-    SetControlText(
-        g_app->rangeTargetLabel,
-        L"Target range: " +
-            (targetRange.has_value()
-                 ? FormatNumber(*targetRange, 1) + L" m; align " +
-                       (rangeReference.has_value()
-                            ? FormatNumber(*rangeReference, 0) + L"M at marker"
-                            : L"(outside L81 range)")
-                 : L"(waiting for two coordinates)"));
-
     UpdateOverlay();
+    InvalidateRect(g_app->mainWindow, nullptr, FALSE);
+    InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleOverlay), nullptr, TRUE);
+    InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleClickThrough), nullptr, TRUE);
 }
 
 DWORD FindTargetProcessId()
@@ -642,14 +592,8 @@ void RefreshTargetGame()
             g_app->targetClientWidth = clientWidth;
             g_app->targetClientHeight = clientHeight;
 
-            const int infoWidth = std::clamp(
-                static_cast<int>(std::lround(clientWidth * 0.26)),
-                280,
-                480);
-            const int infoHeight = std::clamp(
-                static_cast<int>(std::lround(clientHeight * 0.19)),
-                185,
-                205);
+            const int infoWidth = 360;
+            const int infoHeight = 188;
             const int infoX = position.x + std::min(24, std::max(0, clientWidth - infoWidth));
             const int infoY = position.y + std::min(24, std::max(0, clientHeight - infoHeight));
 
@@ -1482,277 +1426,139 @@ void UnregisterGlobalHotkeys(HWND window)
     UnregisterHotKey(window, kHotkeyToggleClickThrough);
 }
 
+// A small shared palette keeps the utility and HUD visually consistent.
+constexpr COLORREF kBackground = RGB(16, 21, 27);
+constexpr COLORREF kSurface = RGB(24, 33, 42);
+constexpr COLORREF kBorder = RGB(43, 57, 69);
+constexpr COLORREF kText = RGB(239, 244, 247);
+constexpr COLORREF kMuted = RGB(155, 173, 188);
+constexpr COLORREF kMint = RGB(112, 225, 184);
+constexpr COLORREF kCoral = RGB(255, 126, 125);
+
+void UiText(HDC dc, const std::wstring& text, RECT rect, int size = 14,
+            COLORREF color = kText, int weight = FW_NORMAL, UINT flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS)
+{
+    HFONT font = CreateFontW(-size, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    auto old = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(dc, text.c_str(), -1, &rect, flags);
+    SelectObject(dc, old);
+    DeleteObject(font);
+}
+
+void Card(HDC dc, RECT rect, COLORREF fill = kSurface, COLORREF edge = kBorder, int radius = 12)
+{
+    HBRUSH brush = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    auto oldBrush = SelectObject(dc, brush);
+    auto oldPen = SelectObject(dc, pen);
+    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
+
+std::wstring RangeValue()
+{
+    auto value = CurrentRangeTargetMeters();
+    return value ? FormatNumber(*value, 1) + L" m" : L"\u2014 m";
+}
+
+std::wstring BearingValue()
+{
+    return g_app->bearing ? FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection : L"\u2014";
+}
+
+std::wstring GuideValue(bool compact)
+{
+    const auto range = CurrentRangeTargetMeters();
+    if (!range) return L"Capture two positions to calculate a solution";
+    const auto reference = NearestRangeReference(*range);
+    if (!reference) return L"Outside L81 range  \u00b7  132\u2013684 m";
+    return L"RNG " + FormatNumber(*reference, 0) + L"M" +
+        (compact ? L"  \u00b7  Align with red guide" : L"  \u00b7  Align this line with the red guide");
+}
+
 void CreateMainControls(HWND window)
 {
-    const HINSTANCE instance = g_app->instance;
+    g_app->uiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    auto button = [&](int id, const wchar_t* label, int x, int y, int w, int h) {
+        HWND control = CreateWindowW(L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+            x, y, w, h, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app->instance, nullptr);
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
+    };
+    button(kCommandCaptureFirst, L"Capture player", 16, 241, 170, 34);
+    button(kCommandCaptureSecond, L"Capture target", 198, 241, 170, 34);
+    button(kCommandToggleOverlay, L"Overlay", 16, 313, 100, 32);
+    button(kCommandToggleClickThrough, L"Click-through", 124, 313, 142, 32);
+    button(kCommandCopyDistance, L"Copy distance  \u00b7  Ctrl+Alt+C", 164, 398, 204, 28);
+    g_app->rangeScaleEdit = CreateWindowExW(0, L"EDIT", L"100.0",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        286, 319, 72, 22, window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlRangeScale)), g_app->instance, nullptr);
+    SendMessageW(g_app->rangeScaleEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
+    SendMessageW(g_app->rangeScaleEdit, EM_SETLIMITTEXT, 12, 0);
+    BOOL dark = TRUE;
+    DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
+    COLORREF caption = kBackground;
+    DwmSetWindowAttribute(window, 35, &caption, sizeof(caption));
+}
 
-    CreateWindowW(
-        L"STATIC",
-        L"War Dogs Artillery",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        14,
-        560,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->statusLabel = CreateWindowW(
-        L"STATIC",
-        L"Open the game map, then press Hotkey 1 to OCR the player's position.",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        46,
-        570,
-        36,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"BUTTON",
-        L"OCR player position  (Ctrl+Alt+1)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        16,
-        92,
-        180,
-        30,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandCaptureFirst)),
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"BUTTON",
-        L"OCR target position  (Ctrl+Alt+2)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        204,
-        92,
-        190,
-        30,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandCaptureSecond)),
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"BUTTON",
-        L"Copy distance  (Ctrl+Alt+C)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        402,
-        92,
-        180,
-        30,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandCopyDistance)),
-        instance,
-        nullptr);
-
-    g_app->firstLabel = CreateWindowW(
-        L"STATIC",
-        L"First coordinate: (not captured)",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        140,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->secondLabel = CreateWindowW(
-        L"STATIC",
-        L"Second coordinate: (not captured)",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        166,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->distanceLabel = CreateWindowW(
-        L"STATIC",
-        L"Distance: (waiting for two coordinates)",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        192,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->directionLabel = CreateWindowW(
-        L"STATIC",
-        L"Direction: (waiting for two coordinates)",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        218,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->overlayStateLabel = CreateWindowW(
-        L"STATIC",
-        L"Overlay: waiting for WardogsClient-Win64-Shipping.exe | Click-through: on",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        248,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->rangeTargetLabel = CreateWindowW(
-        L"STATIC",
-        L"Target range: (waiting for two coordinates)",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        274,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"STATIC",
-        L"Meters per coordinate unit:",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        302,
-        210,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
-
-    g_app->rangeScaleEdit = CreateWindowExW(
-        WS_EX_CLIENTEDGE,
-        L"EDIT",
-        L"100.0",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        228,
-        299,
-        90,
-        24,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlRangeScale)),
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"BUTTON",
-        L"Enable/disable overlay  (Ctrl+Alt+O)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        16,
-        340,
-        220,
-        30,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandToggleOverlay)),
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"BUTTON",
-        L"Toggle click-through  (Ctrl+Alt+T)",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        246,
-        340,
-        230,
-        30,
-        window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCommandToggleClickThrough)),
-        instance,
-        nullptr);
-
-    CreateWindowW(
-        L"STATIC",
-        L"The overlay follows WardogsClient-Win64-Shipping.exe, uses Windows OCR only for X/Y, and does not inject into the game.",
-        WS_CHILD | WS_VISIBLE,
-        16,
-        386,
-        570,
-        24,
-        window,
-        nullptr,
-        instance,
-        nullptr);
+void PaintMain(HDC dc)
+{
+    UiText(dc, L"\u2295", {16, 13, 47, 48}, 30, kMint);
+    UiText(dc, L"WAR DOGS", {55, 14, 240, 47}, 21, kText, FW_SEMIBOLD);
+    UiText(dc, g_app->targetWindow ? L"\u2022  CONNECTED" : L"\u2022  OFFLINE",
+        {245, 16, 368, 46}, 10, g_app->targetWindow ? kMint : kMuted,
+        FW_NORMAL, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    UiText(dc, L"RANGE", {18, 63, 182, 82}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"BEARING", {200, 63, 366, 82}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, RangeValue(), {16, 83, 190, 131}, 34, kText, FW_SEMIBOLD);
+    UiText(dc, BearingValue(), {198, 83, 368, 131}, 34, kText, FW_SEMIBOLD);
+    UiText(dc, GuideValue(true), {16, 138, 368, 164}, 12,
+        CurrentRangeTargetMeters() ? kCoral : kMuted);
+    for (int i = 0; i < 2; ++i)
+    {
+        int x = 16 + i * 182;
+        const auto point = i ? g_app->second : g_app->first;
+        UiText(dc, i ? L"TARGET" : L"PLAYER", {x, 181, x+170, 199}, 10, kMuted);
+        UiText(dc, point ? FormatCoordinate(*point) : L"Not captured", {x, 204, x+170, 229}, 14);
+        UiText(dc, i ? L"Ctrl+Alt+2" : L"Ctrl+Alt+1", {x, 278, x+170, 298}, 11, kMuted,
+            FW_NORMAL, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+    Card(dc, {274, 313, 368, 345});
+    UiText(dc, L"Ctrl+Alt+O", {16, 347, 116, 366}, 10, kMuted);
+    UiText(dc, L"Ctrl+Alt+T", {124, 347, 266, 366}, 10, kMuted);
+    UiText(dc, L"m / unit", {274, 347, 368, 366}, 10, kMuted);
+    UiText(dc, g_app->status, {16, 374, 368, 395}, 11, kMuted);
+    UiText(dc, L"L81  /  RNG", {16, 403, 145, 421}, 10, kMuted);
 }
 
 void PaintOverlay(HWND window, HDC dc)
 {
     RECT client{};
     GetClientRect(window, &client);
-
-    HBRUSH background = CreateSolidBrush(RGB(18, 20, 25));
-    FillRect(dc, &client, background);
-    DeleteObject(background);
-
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-
-    HFONT font = CreateFontW(
-        18,
-        0,
-        0,
-        0,
-        FW_SEMIBOLD,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        L"Segoe UI");
-    HFONT previousFont = static_cast<HFONT>(SelectObject(dc, font));
-
-    const std::wstring title = L"War Dogs Artillery";
-    const std::wstring first =
-        L"First: " +
-        (g_app->first.has_value() ? FormatCoordinate(*g_app->first) : L"(waiting)");
-    const std::wstring second =
-        L"Second: " +
-        (g_app->second.has_value() ? FormatCoordinate(*g_app->second) : L"(waiting)");
-    const std::wstring distance =
-        L"Distance: " +
-        (g_app->distance.has_value() ? FormatNumber(*g_app->distance, 2)
-                                      : L"(waiting for two points)");
-    const std::wstring direction =
-        L"Direction: " +
-        (g_app->bearing.has_value()
-             ? FormatDirection(DirectionResult{*g_app->bearing,
-                                                g_app->compassDirection.c_str()})
-             : L"(waiting for two points)");
-    const std::wstring range = RangeCalibrationText();
-
-    TextOutW(dc, 14, 10, title.c_str(), static_cast<int>(title.size()));
-    TextOutW(dc, 14, 39, first.c_str(), static_cast<int>(first.size()));
-    TextOutW(dc, 14, 68, second.c_str(), static_cast<int>(second.size()));
-    TextOutW(dc, 14, 97, distance.c_str(), static_cast<int>(distance.size()));
-    TextOutW(dc, 14, 126, direction.c_str(), static_cast<int>(direction.size()));
-    TextOutW(dc, 14, 155, range.c_str(), static_cast<int>(range.size()));
-
-    SelectObject(dc, previousFont);
-    DeleteObject(font);
+    Card(dc, client, kBackground);
+    const int w = client.right;
+    UiText(dc, L"WAR DOGS", {16, 10, 150, 32}, 13, kText, FW_SEMIBOLD);
+    UiText(dc, g_app->clickThrough ? L"\u2022  LIVE" : L"\u2022  MOUSE ON", {160, 10, w-16, 32}, 11, kMint,
+        FW_NORMAL, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    UiText(dc, RangeValue(), {16, 37, w/2, 82}, 30, kText, FW_SEMIBOLD);
+    UiText(dc, BearingValue(), {w/2+8, 37, w-16, 82}, 30, kText, FW_SEMIBOLD);
+    UiText(dc, GuideValue(true), {16, 85, w-16, 108}, 12,
+        CurrentRangeTargetMeters() ? kCoral : kMuted);
+    UiText(dc, L"PLAYER", {16, 117, w/2, 133}, 10, kMuted);
+    UiText(dc, L"TARGET", {w/2+8, 117, w-16, 133}, 10, kMuted);
+    UiText(dc, g_app->first ? FormatCoordinate(*g_app->first) : L"Not captured", {16, 134, w/2, 154}, 12);
+    UiText(dc, g_app->second ? FormatCoordinate(*g_app->second) : L"Not captured", {w/2+8, 134, w-16, 154}, 12);
+    UiText(dc, L"Ctrl+Alt+1", {16, 158, w/2, 177}, 10, kMuted);
+    UiText(dc, L"Ctrl+Alt+2", {w/2+8, 158, w-16, 177}, 10, kMuted);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1836,12 +1642,12 @@ void PaintRangeOverlay(HWND window, HDC dc)
         static_cast<int>(std::lround(*guideFraction * static_cast<double>(height))),
         0,
         height - 1);
-    const int markerLabelX = static_cast<int>(
-        std::lround(width * kRangeMarkerLabelXFraction));
     const int barLeft = static_cast<int>(
         std::lround(width * kRangeMarkerBarLeftFraction));
     const int barRight = static_cast<int>(
         std::lround(width * kRangeMarkerBarRightFraction));
+    const int markerLabelX = barRight + static_cast<int>(
+        std::lround(width * kRangeMarkerLabelGapFraction));
 
     HPEN guidePen = CreatePen(PS_SOLID, 3, RGB(255, 55, 55));
     HPEN previousPen = static_cast<HPEN>(SelectObject(dc, guidePen));
@@ -1872,7 +1678,9 @@ void PaintRangeOverlay(HWND window, HDC dc)
     TextOutW(
         dc,
         markerLabelX,
-        std::max(0, guideY - 15),
+        // GDI's font cell has a small top inset; this offset centers the
+        // visible glyphs on the guide instead of centering only the cell.
+        std::max(0, guideY - 12),
         label.c_str(),
         static_cast<int>(label.size()));
 
@@ -1915,6 +1723,57 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
 {
     switch (message)
     {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT rect{};
+        GetClientRect(window, &rect);
+        HDC buffer = CreateCompatibleDC(dc);
+        HBITMAP bitmap = CreateCompatibleBitmap(dc, rect.right, rect.bottom);
+        auto old = SelectObject(buffer, bitmap);
+        HBRUSH background = CreateSolidBrush(kBackground);
+        FillRect(buffer, &rect, background);
+        DeleteObject(background);
+        PaintMain(buffer);
+        BitBlt(dc, 0, 0, rect.right, rect.bottom, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, old);
+        DeleteObject(bitmap);
+        DeleteDC(buffer);
+        EndPaint(window, &paint);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT:
+        SetTextColor(reinterpret_cast<HDC>(wParam), kText);
+        SetBkColor(reinterpret_cast<HDC>(wParam), kSurface);
+        SetDCBrushColor(reinterpret_cast<HDC>(wParam), kSurface);
+        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+    case WM_DRAWITEM:
+    {
+        auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+        SetDCBrushColor(item->hDC, kBackground);
+        FillRect(item->hDC, &item->rcItem, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        bool primary = item->CtlID == kCommandCaptureFirst || item->CtlID == kCommandCaptureSecond;
+        bool down = (item->itemState & ODS_SELECTED) != 0;
+        Card(item->hDC, item->rcItem, primary ? (down ? RGB(81, 190, 154) : kMint) : kSurface,
+            primary ? kMint : kBorder, 8);
+        wchar_t label[128]{};
+        GetWindowTextW(item->hwndItem, label, _countof(label));
+        std::wstring text = label;
+        if (item->CtlID == kCommandToggleOverlay) text += g_app->overlayEnabled ? L"  ON" : L"  OFF";
+        if (item->CtlID == kCommandToggleClickThrough) text += g_app->clickThrough ? L"  ON" : L"  OFF";
+        UiText(item->hDC, text, item->rcItem, 12, primary ? kBackground : kText,
+            primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (item->itemState & ODS_FOCUS)
+        {
+            RECT focus = item->rcItem;
+            InflateRect(&focus, -4, -4);
+            DrawFocusRect(item->hDC, &focus);
+        }
+        return TRUE;
+    }
     case kOcrResultMessage:
         HandleOcrResult(reinterpret_cast<OcrResult*>(lParam));
         return 0;
@@ -2055,7 +1914,7 @@ bool RegisterWindowClasses(HINSTANCE instance)
     mainClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     mainClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     mainClass.hIconSm = mainClass.hIcon;
-    mainClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    mainClass.hbrBackground = nullptr;
 
     WNDCLASSEXW overlayClass{};
     overlayClass.cbSize = sizeof(overlayClass);
@@ -2172,11 +2031,11 @@ int APIENTRY wWinMain(
         0,
         kMainClassName,
         L"War Dogs Artillery",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        620,
-        460,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
+        (GetSystemMetrics(SM_CXSCREEN) - 400) / 2,
+        (GetSystemMetrics(SM_CYSCREEN) - 476) / 2,
+        400,
+        476,
         nullptr,
         nullptr,
         instance,
@@ -2210,10 +2069,12 @@ int APIENTRY wWinMain(
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0)
     {
+        if (IsDialogMessageW(state.mainWindow, &message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
 
+    DeleteObject(state.uiFont);
     g_app = nullptr;
     return static_cast<int>(message.wParam);
 }
