@@ -26,6 +26,7 @@ endif()
 
 target_link_libraries(WarDogsArtillery PRIVATE
     Comctl32
+    Advapi32
     Dwmapi
     Gdi32
     Shell32

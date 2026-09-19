@@ -1,13 +1,13 @@
-# War Dogs Artillery
+# Arty Buddy
 
 A native Windows utility that reads two X/Y coordinates from the Wardogs game map with Windows OCR, calculates the straight-line distance between them, and provides a deterministic L81 mortar range guide.
 
 ## Workflow
 
 1. Open the in-game map while `WardogsClient-Win64-Shipping.exe` is running.
-2. Press `Ctrl+Alt+1` or click **OCR player position**.
+2. Press the configured player-capture hotkey or click **Capture player**.
 3. Move or mark the target position and leave its coordinate visible on the map.
-4. Press `Ctrl+Alt+2` or click **OCR target position**.
+4. Press the configured target-capture hotkey or click **Capture target**.
 5. The calculated distance appears in the utility and in the topmost overlay.
 6. The direction appears as a bearing plus an 8-point compass label, such as `145° SE`.
 7. Keep the scope in RNG mode. The utility chooses the nearest known RNG line and moves a red horizontal guide bar to the exact offset needed for the calculated range.
@@ -23,7 +23,7 @@ The parser accepts forms such as:
 
 Direction uses the game's coordinate orientation: positive X is east/right, positive Y is north/up, `0°` is north, and angles increase clockwise.
 
-OCR captures the center portion of the game client, enlarges it, runs the original-color pass first, then uses thresholded fallback passes, and combines the recognized X and Y labels before parsing. This keeps a threshold pass from replacing a more accurate decimal reading from the original image. A capture attempts to bring the game window to the foreground automatically; Windows OCR must have an installed language recognizer. English is normally provided by the Windows language settings.
+OCR captures the center portion of the game client, briefly hides the app's layered guides while the screenshot settles, enlarges a focused map-label crop, and then uses thresholded fallback passes plus a broader map capture. The parser scores complete two-decimal pairs, tolerates a missing `x`/`y` glyph, and keeps the best focused/consensus result instead of taking the first number from a noisy pass. A capture attempts to bring the game window to the foreground automatically; Windows OCR must have an installed language recognizer. English is normally provided by the Windows language settings.
 
 ## RNG guide
 
@@ -34,7 +34,7 @@ The RNG labels are intentionally not OCR'd. The app uses the fixed L81 reference
 470, 510, 545, 578, 609, 637, 661, 684
 ```
 
-The target range is calculated as distance multiplied by the **Meters per coordinate unit** setting. It defaults to `100.0`, which matches the map-coordinate scale used by the supplied screenshots. Set it to `1.0` if the coordinate values are already meters, or adjust it for another map scale.
+The target range is calculated as distance multiplied by the fixed map scale of `100.0` meters per coordinate unit, which matches the map-coordinate scale used by the supplied screenshots.
 
 The printed values are known reference labels. The overlay selects the nearest one and interpolates its vertical offset using the neighboring label spacing. For example, for a `443 m` target it selects `430M`; because `443` is `13/40` of the way from `430` to `470`, the red guide moves `13/40` of one ladder interval below the optic center. Pull the in-game `430M` line down until it meets that guide. This avoids range OCR entirely, so no Tesseract DLLs or `tessdata` files are required by the application.
 
@@ -42,13 +42,9 @@ The horizontal traverse ladder is handled the same way, using the circular refer
 
 ## Hotkeys
 
-- `Ctrl+Alt+1`: capture the first coordinate
-- `Ctrl+Alt+2`: capture the second coordinate and calculate distance
-- `Ctrl+Alt+O`: enable or disable the overlay
-- `Ctrl+Alt+T`: toggle overlay click-through
-- `Ctrl+Alt+C`: copy the calculated distance
+The default shortcuts are `Ctrl+Alt+1`, `Ctrl+Alt+2`, `Ctrl+Alt+O`, `Ctrl+Alt+T`, and `Ctrl+Alt+C`. Open the settings page with the cog button to assign any shortcut, including Ctrl, Alt, Shift, and Win modifiers. Click a shortcut button, then press the desired key combination.
 
-The application uses a normal topmost layered window that tracks the main window of `WardogsClient-Win64-Shipping.exe`. It is enabled by default and stays click-through unless toggled. It is hidden when the target game is not running or its window is unavailable, and can be disabled with `Ctrl+Alt+O`. It does not inject into DirectX or into the game process. Borderless-windowed games are generally the most reliable target for this kind of overlay; exclusive fullscreen and anti-cheat software may still hide or block any external window.
+The application uses a normal topmost layered window that tracks the main window of `WardogsClient-Win64-Shipping.exe`. It is enabled by default and stays click-through unless toggled. It is shown only while Wardogs is the foreground, non-minimized window; it hides when the game is not running, minimized, or another window is active. It can also be disabled with `Ctrl+Alt+O`. It does not inject into DirectX or into the game process. Borderless-windowed games are generally the most reliable target for this kind of overlay; exclusive fullscreen and anti-cheat software may still hide or block any external window.
 
 ## Build
 

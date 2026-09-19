@@ -22,12 +22,15 @@
 
 #include <atomic>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <cstdlib>
 #include <memory>
 #include <iomanip>
+#include <limits>
 #include <optional>
 #include <regex>
 #include <sstream>
@@ -41,6 +44,7 @@
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "WindowsApp.lib")
 #pragma comment(lib, "Dwmapi.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 namespace
 {
@@ -67,7 +71,24 @@ constexpr int kCommandToggleOverlay = 1003;
 constexpr int kCommandCopyDistance = 1004;
 constexpr int kCommandToggleClickThrough = 1005;
 constexpr int kCommandExit = 1006;
-constexpr int kControlRangeScale = 2001;
+constexpr int kCommandSettings = 1007;
+constexpr int kCommandSettingsBack = 1008;
+constexpr int kCommandHotkeyBase = 1100;
+constexpr size_t kHotkeyCount = 5;
+
+constexpr wchar_t kSettingsRegistryPath[] = L"Software\\ArtyBuddy";
+constexpr const wchar_t* kHotkeyRegistryNames[] = {
+    L"CapturePlayerModifiers",
+    L"CapturePlayerKey",
+    L"CaptureTargetModifiers",
+    L"CaptureTargetKey",
+    L"ToggleOverlayModifiers",
+    L"ToggleOverlayKey",
+    L"CopyDistanceModifiers",
+    L"CopyDistanceKey",
+    L"ToggleClickThroughModifiers",
+    L"ToggleClickThroughKey",
+};
 
 constexpr double kOcrScale = 2.0;
 constexpr double kDefaultMetersPerCoordinateUnit = 100.0;
@@ -90,11 +111,12 @@ constexpr double kRangeMarkerCenterFraction = 0.5;
 // screenshots. Fractions keep the guide proportional when the game window is
 // resized.
 constexpr double kRangeLineSpacingFraction = 102.0 / 1080.0;
-// Keep the marker inside the left side of the reticle. The left edge reaches
-// the ladder line, while the right edge leaves the label just to its right.
+// Keep the marker inside the left side of the reticle. Its length matches the
+// short horizontal range ticks in the supplied 1920x1080 scope reference.
 constexpr double kRangeMarkerBarLeftFraction = 0.369;
-constexpr double kRangeMarkerBarRightFraction = 0.407;
+constexpr double kRangeMarkerBarRightFraction = 0.388;
 constexpr double kRangeMarkerLabelGapFraction = 0.011;
+constexpr int kOverlayGuidePenWidth = 3;
 
 // The horizontal traverse ladder uses 15-degree reference marks. The 0/360
 // seam is circular, so the nearest reference is selected using a wrapped
@@ -114,7 +136,7 @@ constexpr double kAngleLineSpacingFraction = 84.0 / 1920.0;
 
 // The vertical guide sits beneath the compass ladder, clear of the center
 // reticle and the range labels, matching the supplied mockup.
-constexpr double kAngleMarkerTopFraction = 0.312;
+constexpr double kAngleMarkerTopFraction = 0.300;
 constexpr double kAngleMarkerBottomFraction = 0.344;
 constexpr double kAngleMarkerLabelGapFraction = 0.005;
 
@@ -122,6 +144,12 @@ struct Coordinate
 {
     double x{};
     double y{};
+};
+
+struct HotkeyBinding
+{
+    UINT modifiers{};
+    UINT virtualKey{};
 };
 
 struct CapturedImage
@@ -141,12 +169,25 @@ struct CapturedRegion
     int clientHeight{};
 };
 
+struct OcrTextPass
+{
+    std::wstring text;
+    bool focused{};
+};
+
+struct OcrRecognition
+{
+    std::wstring combinedText;
+    std::vector<OcrTextPass> passes;
+};
+
 struct OcrResult
 {
     bool firstPoint{};
     bool coordinateFound{};
     Coordinate coordinate{};
     std::wstring recognizedText;
+    std::vector<OcrTextPass> ocrPasses;
     std::wstring error;
 };
 
@@ -159,7 +200,6 @@ struct AppState
     HWND targetWindow{};
     DWORD targetProcessId{};
 
-    HWND rangeScaleEdit{};
     HFONT uiFont{};
     std::wstring status{L"Open the map, then capture player and target positions."};
 
@@ -178,10 +218,131 @@ struct AppState
     bool overlayVisible{false};
     bool clickThrough{true};
     bool closing{false};
+    bool settingsVisible{false};
+    bool hotkeysRegistered{false};
+    int activeHotkeyIndex{-1};
+    HotkeyBinding hotkeyCaptureOriginal{};
+    std::array<HotkeyBinding, kHotkeyCount> hotkeys{};
+    std::array<HWND, kHotkeyCount> hotkeyControls{};
+    HWND settingsButton{};
+    HWND settingsBackButton{};
     std::atomic_bool ocrInProgress{false};
 };
 
 AppState* g_app = nullptr;
+
+constexpr UINT kSupportedHotkeyModifiers =
+    MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN;
+
+std::array<HotkeyBinding, kHotkeyCount> DefaultHotkeyBindings()
+{
+    return {
+        HotkeyBinding{MOD_CONTROL | MOD_ALT, '1'},
+        HotkeyBinding{MOD_CONTROL | MOD_ALT, '2'},
+        HotkeyBinding{MOD_CONTROL | MOD_ALT, 'O'},
+        HotkeyBinding{MOD_CONTROL | MOD_ALT, 'C'},
+        HotkeyBinding{MOD_CONTROL | MOD_ALT, 'T'},
+    };
+}
+
+bool IsValidHotkeyBinding(const HotkeyBinding& binding)
+{
+    return binding.virtualKey != 0 &&
+           (binding.modifiers & ~kSupportedHotkeyModifiers) == 0;
+}
+
+void LoadHotkeyBindings(AppState& state)
+{
+    state.hotkeys = DefaultHotkeyBindings();
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            kSettingsRegistryPath,
+            0,
+            KEY_QUERY_VALUE,
+            &key) != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        DWORD modifiers = 0;
+        DWORD virtualKey = 0;
+        DWORD modifiersSize = sizeof(modifiers);
+        DWORD virtualKeySize = sizeof(virtualKey);
+        const auto modifiersResult = RegGetValueW(
+            key,
+            nullptr,
+            kHotkeyRegistryNames[index * 2],
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &modifiers,
+            &modifiersSize);
+        const auto virtualKeyResult = RegGetValueW(
+            key,
+            nullptr,
+            kHotkeyRegistryNames[index * 2 + 1],
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &virtualKey,
+            &virtualKeySize);
+
+        const HotkeyBinding loaded{
+            static_cast<UINT>(modifiers),
+            static_cast<UINT>(virtualKey)};
+        if (modifiersResult == ERROR_SUCCESS &&
+            virtualKeyResult == ERROR_SUCCESS &&
+            IsValidHotkeyBinding(loaded))
+        {
+            state.hotkeys[index] = loaded;
+        }
+    }
+
+    RegCloseKey(key);
+}
+
+void SaveHotkeyBindings(const AppState& state)
+{
+    HKEY key = nullptr;
+    DWORD disposition = 0;
+    if (RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            kSettingsRegistryPath,
+            0,
+            nullptr,
+            0,
+            KEY_SET_VALUE,
+            nullptr,
+            &key,
+            &disposition) != ERROR_SUCCESS)
+    {
+        return;
+    }
+
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        const DWORD modifiers = state.hotkeys[index].modifiers;
+        const DWORD virtualKey = state.hotkeys[index].virtualKey;
+        RegSetValueExW(
+            key,
+            kHotkeyRegistryNames[index * 2],
+            0,
+            REG_DWORD,
+            reinterpret_cast<const BYTE*>(&modifiers),
+            sizeof(modifiers));
+        RegSetValueExW(
+            key,
+            kHotkeyRegistryNames[index * 2 + 1],
+            0,
+            REG_DWORD,
+            reinterpret_cast<const BYTE*>(&virtualKey),
+            sizeof(virtualKey));
+    }
+
+    RegCloseKey(key);
+}
 
 std::wstring FormatNumber(double value, int precision = 2)
 {
@@ -193,6 +354,67 @@ std::wstring FormatNumber(double value, int precision = 2)
     std::wostringstream output;
     output << std::fixed << std::setprecision(precision) << value;
     return output.str();
+}
+
+std::wstring HotkeyKeyName(UINT virtualKey)
+{
+    if (virtualKey == VK_SPACE)
+    {
+        return L"Space";
+    }
+
+    UINT scanCode = MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC);
+    LONG keyNameCode = static_cast<LONG>(scanCode << 16);
+    if (virtualKey == VK_LEFT || virtualKey == VK_RIGHT ||
+        virtualKey == VK_UP || virtualKey == VK_DOWN ||
+        virtualKey == VK_PRIOR || virtualKey == VK_NEXT ||
+        virtualKey == VK_END || virtualKey == VK_HOME ||
+        virtualKey == VK_INSERT || virtualKey == VK_DELETE ||
+        virtualKey == VK_DIVIDE)
+    {
+        keyNameCode |= (1L << 24);
+    }
+
+    wchar_t keyName[64]{};
+    const int length = GetKeyNameTextW(keyNameCode, keyName, _countof(keyName));
+    if (length > 0)
+    {
+        return std::wstring(keyName, static_cast<size_t>(length));
+    }
+
+    if (virtualKey >= VK_F1 && virtualKey <= VK_F24)
+    {
+        return L"F" + std::to_wstring(virtualKey - VK_F1 + 1);
+    }
+
+    return L"Key " + FormatNumber(static_cast<double>(virtualKey), 0);
+}
+
+std::wstring FormatHotkey(const HotkeyBinding& binding)
+{
+    if (!IsValidHotkeyBinding(binding))
+    {
+        return L"Unassigned";
+    }
+
+    std::wstring result;
+    if ((binding.modifiers & MOD_CONTROL) != 0)
+    {
+        result += L"Ctrl+";
+    }
+    if ((binding.modifiers & MOD_ALT) != 0)
+    {
+        result += L"Alt+";
+    }
+    if ((binding.modifiers & MOD_SHIFT) != 0)
+    {
+        result += L"Shift+";
+    }
+    if ((binding.modifiers & MOD_WIN) != 0)
+    {
+        result += L"Win+";
+    }
+    return result + HotkeyKeyName(binding.virtualKey);
 }
 
 std::wstring FormatCoordinate(const Coordinate& coordinate)
@@ -361,38 +583,390 @@ bool SetClipboardText(const std::wstring& text)
     return true;
 }
 
-std::optional<Coordinate> ParseOcrCoordinate(const std::wstring& text)
+struct OcrNumberToken
 {
-    // OCR normally returns the two labels on separate lines, for example:
-    //   x100.85
-    //   y105.89
-    // Allow whitespace or punctuation between each label and its value.
-    const std::wstring number = LR"([-+]?(?:\d+(?:\.\d*)?|\.\d+))";
+    double value{};
+    std::size_t position{};
+    std::size_t length{};
+    int fractionalDigits{};
+};
+
+struct OcrLabeledValue
+{
+    OcrNumberToken value;
+    std::size_t labelPosition{};
+};
+
+struct ParsedOcrCoordinate
+{
+    Coordinate coordinate{};
+    int quality{};
+};
+
+const std::wstring& OcrNumberPattern()
+{
+    static const std::wstring pattern =
+        LR"([-+]?(?:\d+(?:\.\d*)?|\.\d+))";
+    return pattern;
+}
+
+const std::wstring& OcrNumberLikePattern()
+{
+    // Windows OCR commonly returns zeroes as 'o' and nines as 'g' when the
+    // coordinate text is over a textured map. Restrict these substitutions
+    // to values immediately following an x/y label.
+    static const std::wstring pattern =
+        LR"([-+]?(?:[0-9OoGgSsBbIiLl|]+(?:\.[0-9OoGgSsBbIiLl|]*)?|\.[0-9OoGgSsBbIiLl|]+))";
+    return pattern;
+}
+
+std::optional<OcrNumberToken> ParseOcrNumberToken(
+    const std::wstring& value,
+    std::size_t position)
+{
+    try
+    {
+        std::wstring normalized;
+        normalized.reserve(value.size());
+        for (const wchar_t character : value)
+        {
+            switch (character)
+            {
+            case L'o':
+            case L'O':
+                normalized += L'0';
+                break;
+            case L'g':
+            case L'G':
+                normalized += L'9';
+                break;
+            case L's':
+            case L'S':
+                normalized += L'5';
+                break;
+            case L'b':
+            case L'B':
+                normalized += L'8';
+                break;
+            case L'i':
+            case L'I':
+            case L'l':
+            case L'L':
+            case L'|':
+                normalized += L'1';
+                break;
+            default:
+                normalized += character;
+                break;
+            }
+        }
+
+        const double parsed = std::stod(normalized);
+        if (!std::isfinite(parsed))
+        {
+            return std::nullopt;
+        }
+
+        const std::size_t decimal = normalized.find(L'.');
+        const int fractionalDigits = decimal == std::wstring::npos
+            ? 0
+            : static_cast<int>(normalized.size() - decimal - 1);
+        return OcrNumberToken{
+            parsed,
+            position,
+            value.size(),
+            fractionalDigits};
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+}
+
+std::vector<OcrNumberToken> FindOcrNumberTokens(const std::wstring& text)
+{
+    std::vector<OcrNumberToken> numbers;
 
     try
     {
-        const std::wregex xPattern(L"[xX]\\s*[:=]?\\s*(" + number + L")");
-        const std::wregex yPattern(L"[yY]\\s*[:=]?\\s*(" + number + L")");
-        std::wsmatch xMatch;
-        std::wsmatch yMatch;
-
-        if (std::regex_search(text, xMatch, xPattern) && xMatch.size() >= 2 &&
-            std::regex_search(text, yMatch, yPattern) && yMatch.size() >= 2)
+        const std::wregex numberRegex(OcrNumberPattern());
+        for (std::wsregex_iterator iterator(text.begin(), text.end(), numberRegex);
+             iterator != std::wsregex_iterator();
+             ++iterator)
         {
-            const double x = std::stod(xMatch[1].str());
-            const double y = std::stod(yMatch[1].str());
-            if (std::isfinite(x) && std::isfinite(y))
+            const auto match = *iterator;
+            const auto token = ParseOcrNumberToken(
+                match.str(),
+                static_cast<std::size_t>(match.position()));
+            if (token.has_value())
             {
-                return Coordinate{x, y};
+                numbers.push_back(*token);
             }
         }
     }
     catch (const std::exception&)
     {
-        // Invalid numeric text is handled as a parse failure below.
+        // Invalid OCR text is handled as a parse failure below.
+    }
+
+    return numbers;
+}
+
+std::vector<OcrLabeledValue> FindOcrLabeledValues(
+    const std::wstring& text,
+    wchar_t label)
+{
+    std::vector<OcrLabeledValue> values;
+
+    try
+    {
+        const std::wstring labelPattern = label == L'x'
+            ? L"[xX]"
+            : L"[yY]";
+        const std::wregex pattern(
+            labelPattern + L"\\s*[:=]?\\s*(" + OcrNumberLikePattern() + L")");
+
+        for (std::wsregex_iterator iterator(text.begin(), text.end(), pattern);
+             iterator != std::wsregex_iterator();
+             ++iterator)
+        {
+            const auto match = *iterator;
+            if (match.size() < 2)
+            {
+                continue;
+            }
+
+            const auto token = ParseOcrNumberToken(
+                match.str(1),
+                static_cast<std::size_t>(match.position(1)));
+            if (token.has_value())
+            {
+                values.push_back(OcrLabeledValue{
+                    *token,
+                    static_cast<std::size_t>(match.position())});
+            }
+        }
+    }
+    catch (const std::exception&)
+    {
+        // Invalid OCR text is handled as a parse failure below.
+    }
+
+    return values;
+}
+
+int OcrPrecisionQuality(const OcrNumberToken& token)
+{
+    // The game prints two fractional digits. Prefer that stable format over
+    // a noisy pass that invents or drops a decimal digit.
+    if (token.fractionalDigits == 2)
+    {
+        return 15;
+    }
+    if (token.fractionalDigits == 1)
+    {
+        return 5;
+    }
+    if (token.fractionalDigits == 3)
+    {
+        return 2;
+    }
+    return 0;
+}
+
+const OcrNumberToken* FindNearestDecimalToken(
+    const std::vector<OcrNumberToken>& numbers,
+    std::size_t anchor,
+    bool preferBefore)
+{
+    const OcrNumberToken* nearest = nullptr;
+    long long nearestScore = std::numeric_limits<long long>::max();
+
+    for (const auto& number : numbers)
+    {
+        if (number.fractionalDigits == 0 || number.position == anchor)
+        {
+            continue;
+        }
+
+        const bool before = number.position < anchor;
+        const auto distance = std::llabs(
+            static_cast<long long>(number.position) -
+            static_cast<long long>(anchor));
+        if (distance > 240)
+        {
+            continue;
+        }
+
+        const long long directionPenalty = before == preferBefore ? 0 : 60;
+        const long long score = distance + directionPenalty;
+        if (score < nearestScore)
+        {
+            nearest = &number;
+            nearestScore = score;
+        }
+    }
+
+    return nearest;
+}
+
+std::optional<ParsedOcrCoordinate> ParseSingleOcrCoordinate(
+    const std::wstring& text)
+{
+    const auto numbers = FindOcrNumberTokens(text);
+    const auto xValues = FindOcrLabeledValues(text, L'x');
+    const auto yValues = FindOcrLabeledValues(text, L'y');
+
+    if (!xValues.empty() && !yValues.empty())
+    {
+        const OcrLabeledValue* bestX = nullptr;
+        const OcrLabeledValue* bestY = nullptr;
+        long long bestDistance = std::numeric_limits<long long>::max();
+
+        for (const auto& x : xValues)
+        {
+            for (const auto& y : yValues)
+            {
+                const auto distance = std::llabs(
+                    static_cast<long long>(x.labelPosition) -
+                    static_cast<long long>(y.labelPosition));
+                if (distance < bestDistance)
+                {
+                    bestX = &x;
+                    bestY = &y;
+                    bestDistance = distance;
+                }
+            }
+        }
+
+        if (bestX != nullptr && bestY != nullptr)
+        {
+            return ParsedOcrCoordinate{
+                Coordinate{bestX->value.value, bestY->value.value},
+                60 + OcrPrecisionQuality(bestX->value) +
+                    OcrPrecisionQuality(bestY->value)};
+        }
+    }
+
+    // Windows OCR sometimes drops the small 'y' glyph, while retaining the
+    // decimal number. In the map UI the y label is immediately above the x
+    // label, so associate the nearest decimal token with a surviving x label.
+    if (!xValues.empty())
+    {
+        const auto& x = xValues.front();
+        const auto* y = FindNearestDecimalToken(numbers, x.value.position, true);
+        if (y != nullptr)
+        {
+            return ParsedOcrCoordinate{
+                Coordinate{x.value.value, y->value},
+                35 + OcrPrecisionQuality(x.value) +
+                    OcrPrecisionQuality(*y)};
+        }
+    }
+
+    // Conversely, if the x glyph is missing, pair a surviving y label with
+    // the nearest decimal number that follows it.
+    if (!yValues.empty())
+    {
+        const auto& y = yValues.front();
+        const auto* x = FindNearestDecimalToken(numbers, y.value.position, false);
+        if (x != nullptr)
+        {
+            return ParsedOcrCoordinate{
+                Coordinate{x->value, y.value.value},
+                35 + OcrPrecisionQuality(*x) +
+                    OcrPrecisionQuality(y.value)};
+        }
+    }
+
+    // Keep support for a clean, unlabeled "x, y" OCR result. This fallback
+    // is deliberately only used when there are exactly two decimal values,
+    // so axis/range integers in the broad capture cannot become coordinates.
+    std::vector<const OcrNumberToken*> decimalNumbers;
+    for (const auto& number : numbers)
+    {
+        if (number.fractionalDigits > 0)
+        {
+            decimalNumbers.push_back(&number);
+        }
+    }
+    if (decimalNumbers.size() == 2)
+    {
+        return ParsedOcrCoordinate{
+            Coordinate{decimalNumbers[0]->value, decimalNumbers[1]->value},
+            20 + OcrPrecisionQuality(*decimalNumbers[0]) +
+                OcrPrecisionQuality(*decimalNumbers[1])};
     }
 
     return std::nullopt;
+}
+
+std::optional<Coordinate> ParseOcrCoordinate(const std::wstring& text)
+{
+    const auto parsed = ParseSingleOcrCoordinate(text);
+    return parsed.has_value()
+        ? std::optional<Coordinate>(parsed->coordinate)
+        : std::nullopt;
+}
+
+std::optional<Coordinate> SelectOcrCoordinate(
+    const std::vector<OcrTextPass>& passes)
+{
+    std::vector<ParsedOcrCoordinate> candidates;
+    candidates.reserve(passes.size());
+
+    for (const auto& pass : passes)
+    {
+        const auto parsed = ParseSingleOcrCoordinate(pass.text);
+        if (!parsed.has_value())
+        {
+            continue;
+        }
+
+        ParsedOcrCoordinate candidate = *parsed;
+        if (pass.focused)
+        {
+            // A focused map-label pass has fewer axis and HUD numbers to
+            // confuse the parser, so let it win when OCR quality is close.
+            candidate.quality += 12;
+        }
+        candidates.push_back(candidate);
+    }
+
+    if (candidates.empty())
+    {
+        return std::nullopt;
+    }
+
+    std::size_t bestIndex = 0;
+    int bestScore = std::numeric_limits<int>::min();
+    for (std::size_t index = 0; index < candidates.size(); ++index)
+    {
+        int score = candidates[index].quality;
+        for (std::size_t other = 0; other < candidates.size(); ++other)
+        {
+            if (index == other)
+            {
+                continue;
+            }
+
+            if (std::abs(candidates[index].coordinate.x -
+                         candidates[other].coordinate.x) < 0.005 &&
+                std::abs(candidates[index].coordinate.y -
+                         candidates[other].coordinate.y) < 0.005)
+            {
+                score += 6;
+            }
+        }
+
+        if (score > bestScore)
+        {
+            bestIndex = index;
+            bestScore = score;
+        }
+    }
+
+    return candidates[bestIndex].coordinate;
 }
 
 void SetStatus(const std::wstring& message)
@@ -446,32 +1020,6 @@ void UpdateOverlay()
     }
 }
 
-double ReadRangeScaleMeters()
-{
-    if (g_app == nullptr || g_app->rangeScaleEdit == nullptr)
-    {
-        return kDefaultMetersPerCoordinateUnit;
-    }
-
-    wchar_t buffer[64]{};
-    GetWindowTextW(g_app->rangeScaleEdit, buffer, _countof(buffer));
-
-    try
-    {
-        const double value = std::stod(buffer);
-        if (std::isfinite(value) && value > 0.0 && value <= 100000.0)
-        {
-            return value;
-        }
-    }
-    catch (const std::exception&)
-    {
-        // Treat an empty or partially edited field as the default for now.
-    }
-
-    return kDefaultMetersPerCoordinateUnit;
-}
-
 std::optional<double> CurrentRangeTargetMeters()
 {
     if (g_app == nullptr || !g_app->distance.has_value())
@@ -479,7 +1027,7 @@ std::optional<double> CurrentRangeTargetMeters()
         return std::nullopt;
     }
 
-    const double target = *g_app->distance * ReadRangeScaleMeters();
+    const double target = *g_app->distance * kDefaultMetersPerCoordinateUnit;
     if (!std::isfinite(target) || target < 0.0)
     {
         return std::nullopt;
@@ -561,32 +1109,6 @@ std::optional<double> CalculateRangeGuideFraction(double targetMeters)
         1.0);
 }
 
-std::wstring RangeCalibrationText()
-{
-    if (g_app == nullptr)
-    {
-        return L"RNG: unavailable";
-    }
-
-    const auto target = CurrentRangeTargetMeters();
-    if (!target.has_value())
-    {
-        return L"RNG: waiting for two coordinates";
-    }
-
-    const auto reference = NearestRangeReference(*target);
-    if (!reference.has_value())
-    {
-        return L"RNG: target outside L81 range (" +
-               FormatNumber(kRangeReferenceValues[0], 0) + L"-" +
-               FormatNumber(kRangeReferenceValues[_countof(kRangeReferenceValues) - 1], 0) +
-               L"M)";
-    }
-
-    return L"RNG: align " + FormatNumber(*reference, 0) +
-           L"M at marker for target " + FormatNumber(*target, 1) + L" m";
-}
-
 void UpdateDisplay()
 {
     if (g_app == nullptr)
@@ -598,6 +1120,21 @@ void UpdateDisplay()
     InvalidateRect(g_app->mainWindow, nullptr, FALSE);
     InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleOverlay), nullptr, TRUE);
     InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleClickThrough), nullptr, TRUE);
+    if (g_app->settingsButton != nullptr)
+    {
+        InvalidateRect(g_app->settingsButton, nullptr, TRUE);
+    }
+    if (g_app->settingsBackButton != nullptr)
+    {
+        InvalidateRect(g_app->settingsBackButton, nullptr, TRUE);
+    }
+    for (const HWND control : g_app->hotkeyControls)
+    {
+        if (control != nullptr)
+        {
+            InvalidateRect(control, nullptr, TRUE);
+        }
+    }
 }
 
 DWORD FindTargetProcessId()
@@ -662,6 +1199,34 @@ HWND FindTargetMainWindow(DWORD processId)
     return search.window;
 }
 
+bool IsTargetGameForeground(HWND targetWindow, DWORD targetProcessId)
+{
+    if (targetWindow == nullptr || targetProcessId == 0 ||
+        !IsWindow(targetWindow))
+    {
+        return false;
+    }
+
+    const HWND foregroundWindow = GetForegroundWindow();
+    if (foregroundWindow == nullptr)
+    {
+        return false;
+    }
+
+    DWORD foregroundProcessId = 0;
+    if (GetWindowThreadProcessId(foregroundWindow, &foregroundProcessId) == 0 ||
+        foregroundProcessId != targetProcessId)
+    {
+        return false;
+    }
+
+    // The main game window is normally foreground. Accept a dialog owned by
+    // that window as well, while rejecting unrelated windows in the same
+    // process.
+    return foregroundWindow == targetWindow ||
+           GetAncestor(foregroundWindow, GA_ROOTOWNER) == targetWindow;
+}
+
 void RefreshTargetGame()
 {
     if (g_app == nullptr || g_app->overlayWindow == nullptr)
@@ -677,8 +1242,11 @@ void RefreshTargetGame()
     g_app->targetProcessId = processId;
     g_app->targetWindow = targetWindow;
 
+    const bool targetIsForeground =
+        IsTargetGameForeground(targetWindow, processId);
     bool shouldShow = g_app->overlayEnabled && targetWindow != nullptr &&
-                      IsWindowVisible(targetWindow) && !IsIconic(targetWindow);
+                      IsWindowVisible(targetWindow) && !IsIconic(targetWindow) &&
+                      targetIsForeground;
 
     if (shouldShow)
     {
@@ -897,6 +1465,49 @@ std::optional<CapturedRegion> CaptureClientRegion(
     return region;
 }
 
+CapturedImage CropCapturedImage(
+    const CapturedImage& source,
+    double leftFraction,
+    double topFraction,
+    double rightFraction,
+    double bottomFraction)
+{
+    const int left = std::clamp(
+        static_cast<int>(std::lround(source.width * leftFraction)),
+        0,
+        std::max(0, source.width - 1));
+    const int top = std::clamp(
+        static_cast<int>(std::lround(source.height * topFraction)),
+        0,
+        std::max(0, source.height - 1));
+    const int right = std::clamp(
+        static_cast<int>(std::lround(source.width * rightFraction)),
+        left + 1,
+        source.width);
+    const int bottom = std::clamp(
+        static_cast<int>(std::lround(source.height * bottomFraction)),
+        top + 1,
+        source.height);
+
+    CapturedImage cropped;
+    cropped.width = right - left;
+    cropped.height = bottom - top;
+    cropped.stride = cropped.width * 4;
+    cropped.pixels.resize(static_cast<size_t>(cropped.stride) * cropped.height);
+
+    for (int y = 0; y < cropped.height; ++y)
+    {
+        const auto* sourceRow = source.pixels.data() +
+            (static_cast<size_t>(top + y) * source.stride) +
+            (static_cast<size_t>(left) * 4);
+        auto* destinationRow = cropped.pixels.data() +
+            (static_cast<size_t>(y) * cropped.stride);
+        std::memcpy(destinationRow, sourceRow, static_cast<size_t>(cropped.stride));
+    }
+
+    return cropped;
+}
+
 std::optional<CapturedImage> CaptureMapRegion(HWND targetWindow, std::wstring& error)
 {
     // The coordinate labels are inside the centered map panel. Keep this
@@ -1065,7 +1676,9 @@ winrt::Windows::Graphics::Imaging::SoftwareBitmap MakeSoftwareBitmap(
         BitmapAlphaMode::Ignore);
 }
 
-std::wstring RecognizeImageText(const CapturedImage& image, std::wstring& error)
+OcrRecognition RecognizeImageText(
+    const CapturedImage& image,
+    std::wstring& error)
 {
     struct ApartmentGuard
     {
@@ -1096,18 +1709,22 @@ std::wstring RecognizeImageText(const CapturedImage& image, std::wstring& error)
             return {};
         }
 
-        std::wstring allRecognizedText;
-        for (const OcrImageMode mode : {
-                 // Keep the unmodified map first.  The thresholded passes
-                 // are useful fallbacks, but can distort small decimal
-                 // glyphs (for example, turning 35 into 55).
-                 OcrImageMode::Original,
-                 OcrImageMode::BrightTextThreshold,
-                 OcrImageMode::DarkTextThreshold,
-                 OcrImageMode::LocalDarkTextThreshold})
+        OcrRecognition recognition;
+        const auto focusedImage = CropCapturedImage(
+            image,
+            0.30,
+            0.26,
+            0.72,
+            0.70);
+
+        const auto recognizePass =
+            [&engine, &recognition](
+                const CapturedImage& source,
+                OcrImageMode mode,
+                bool focused)
         {
             const CapturedImage prepared = PrepareOcrImage(
-                image,
+                source,
                 mode,
                 static_cast<int>(kOcrScale),
                 false);
@@ -1115,15 +1732,41 @@ std::wstring RecognizeImageText(const CapturedImage& image, std::wstring& error)
             const auto result = engine.RecognizeAsync(bitmap).get();
             const std::wstring recognized = result.Text().c_str();
 
-            if (!allRecognizedText.empty() && !recognized.empty())
+            if (!recognition.combinedText.empty() && !recognized.empty())
             {
-                allRecognizedText += L"\n";
+                recognition.combinedText += L"\n";
             }
-            allRecognizedText += recognized;
+            recognition.combinedText += recognized;
+            recognition.passes.push_back(OcrTextPass{recognized, focused});
+        };
+
+        // The coordinate labels are small and often sit over textured map
+        // imagery. A center-focused pass gives Windows OCR enough scale and
+        // context to retain both decimal digits. Keep the broad passes too,
+        // because a marked point may be away from the exact map center.
+        for (const OcrImageMode mode : {
+                 OcrImageMode::Original,
+                 OcrImageMode::BrightTextThreshold,
+                 OcrImageMode::DarkTextThreshold,
+                 OcrImageMode::LocalDarkTextThreshold})
+        {
+            recognizePass(focusedImage, mode, true);
+        }
+
+        for (const OcrImageMode mode : {
+                 // Keep the unmodified map first within the broad passes.
+                 // Thresholded passes are useful fallbacks, but can distort
+                 // small decimal glyphs.
+                 OcrImageMode::Original,
+                 OcrImageMode::BrightTextThreshold,
+                 OcrImageMode::DarkTextThreshold,
+                 OcrImageMode::LocalDarkTextThreshold})
+        {
+            recognizePass(image, mode, false);
         }
 
         error = L"OCR completed, but no x###.## and y###.## coordinate pair was found.";
-        return allRecognizedText;
+        return recognition;
     }
     catch (const winrt::hresult_error& exception)
     {
@@ -1259,6 +1902,12 @@ void StartOcrCapture(bool firstPoint)
         ShowWindow(g_app->rangeOverlayWindow, SW_HIDE);
     }
 
+    // The guides are layered windows. Give DWM a chance to commit their
+    // hidden state before BitBlt reads the desktop, otherwise one frame of a
+    // red guide can remain over a coordinate glyph and change its OCR.
+    DwmFlush();
+    Sleep(50);
+
     std::wstring captureError;
     const auto captured = CaptureMapRegion(g_app->targetWindow, captureError);
 
@@ -1289,11 +1938,13 @@ void StartOcrCapture(bool firstPoint)
         {
             auto* result = new OcrResult();
             result->firstPoint = firstPoint;
-            result->recognizedText = RecognizeImageText(image, result->error);
+            const auto recognition = RecognizeImageText(image, result->error);
+            result->recognizedText = recognition.combinedText;
+            result->ocrPasses = recognition.passes;
 
-            if (!result->recognizedText.empty())
+            if (!result->ocrPasses.empty())
             {
-                const auto coordinate = ParseOcrCoordinate(result->recognizedText);
+                const auto coordinate = SelectOcrCoordinate(result->ocrPasses);
                 if (coordinate.has_value())
                 {
                     result->coordinate = *coordinate;
@@ -1463,7 +2114,7 @@ void AddTrayIcon()
     wcsncpy_s(
         g_app->tray.szTip,
         _countof(g_app->tray.szTip),
-        L"War Dogs Artillery",
+        L"Arty Buddy",
         _TRUNCATE);
 
     Shell_NotifyIconW(NIM_ADD, &g_app->tray);
@@ -1515,15 +2166,25 @@ void ShowTrayMenu(HWND owner)
 
 bool RegisterGlobalHotkeys(HWND window)
 {
+    if (g_app == nullptr)
+    {
+        return false;
+    }
+
     bool allRegistered = true;
-    const UINT modifiers = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        const auto& binding = g_app->hotkeys[index];
+        const int id = kHotkeyFirst + static_cast<int>(index);
+        allRegistered &= IsValidHotkeyBinding(binding) &&
+            RegisterHotKey(
+                window,
+                id,
+                binding.modifiers | MOD_NOREPEAT,
+                binding.virtualKey) != FALSE;
+    }
 
-    allRegistered &= RegisterHotKey(window, kHotkeyFirst, modifiers, '1') != FALSE;
-    allRegistered &= RegisterHotKey(window, kHotkeySecond, modifiers, '2') != FALSE;
-    allRegistered &= RegisterHotKey(window, kHotkeyToggleOverlay, modifiers, 'O') != FALSE;
-    allRegistered &= RegisterHotKey(window, kHotkeyCopyDistance, modifiers, 'C') != FALSE;
-    allRegistered &= RegisterHotKey(window, kHotkeyToggleClickThrough, modifiers, 'T') != FALSE;
-
+    g_app->hotkeysRegistered = allRegistered;
     return allRegistered;
 }
 
@@ -1534,6 +2195,213 @@ void UnregisterGlobalHotkeys(HWND window)
     UnregisterHotKey(window, kHotkeyToggleOverlay);
     UnregisterHotKey(window, kHotkeyCopyDistance);
     UnregisterHotKey(window, kHotkeyToggleClickThrough);
+    if (g_app != nullptr)
+    {
+        g_app->hotkeysRegistered = false;
+    }
+}
+
+constexpr const wchar_t* kHotkeyActionLabels[] = {
+    L"Capture player",
+    L"Capture target",
+    L"Toggle overlay",
+    L"Copy distance",
+    L"Click-through",
+};
+
+bool IsHotkeyModifierKey(UINT virtualKey)
+{
+    return virtualKey == VK_SHIFT || virtualKey == VK_LSHIFT ||
+           virtualKey == VK_RSHIFT || virtualKey == VK_CONTROL ||
+           virtualKey == VK_LCONTROL || virtualKey == VK_RCONTROL ||
+           virtualKey == VK_MENU || virtualKey == VK_LMENU ||
+           virtualKey == VK_RMENU || virtualKey == VK_LWIN ||
+           virtualKey == VK_RWIN;
+}
+
+UINT CurrentHotkeyModifiers()
+{
+    UINT modifiers = 0;
+    if ((GetKeyState(VK_CONTROL) & 0x8000) != 0)
+    {
+        modifiers |= MOD_CONTROL;
+    }
+    if ((GetKeyState(VK_MENU) & 0x8000) != 0)
+    {
+        modifiers |= MOD_ALT;
+    }
+    if ((GetKeyState(VK_SHIFT) & 0x8000) != 0)
+    {
+        modifiers |= MOD_SHIFT;
+    }
+    if ((GetKeyState(VK_LWIN) & 0x8000) != 0 ||
+        (GetKeyState(VK_RWIN) & 0x8000) != 0)
+    {
+        modifiers |= MOD_WIN;
+    }
+    return modifiers;
+}
+
+void RefreshHotkeyControlLabels()
+{
+    if (g_app == nullptr)
+    {
+        return;
+    }
+
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        if (g_app->hotkeyControls[index] == nullptr)
+        {
+            continue;
+        }
+
+        const std::wstring label = g_app->activeHotkeyIndex ==
+                static_cast<int>(index)
+            ? L"Press a key..."
+            : FormatHotkey(g_app->hotkeys[index]);
+        SetWindowTextW(g_app->hotkeyControls[index], label.c_str());
+        InvalidateRect(g_app->hotkeyControls[index], nullptr, TRUE);
+    }
+}
+
+void CancelHotkeyCapture(HWND window)
+{
+    if (g_app == nullptr || g_app->activeHotkeyIndex < 0)
+    {
+        return;
+    }
+
+    g_app->activeHotkeyIndex = -1;
+    RefreshHotkeyControlLabels();
+    if (!g_app->hotkeysRegistered)
+    {
+        RegisterGlobalHotkeys(window);
+    }
+    SetFocus(window);
+}
+
+void BeginHotkeyCapture(HWND window, size_t index)
+{
+    if (g_app == nullptr || index >= kHotkeyCount ||
+        g_app->settingsVisible == false)
+    {
+        return;
+    }
+
+    if (g_app->activeHotkeyIndex >= 0)
+    {
+        CancelHotkeyCapture(window);
+    }
+
+    UnregisterGlobalHotkeys(window);
+    g_app->activeHotkeyIndex = static_cast<int>(index);
+    g_app->hotkeyCaptureOriginal = g_app->hotkeys[index];
+    RefreshHotkeyControlLabels();
+
+    // The top-level window receives the next key message, including
+    // WM_SYSKEYDOWN for Alt combinations, while the button remains visibly
+    // armed as the capture target.
+    SetFocus(window);
+    UpdateDisplay();
+}
+
+void CompleteHotkeyCapture(HWND window, UINT virtualKey)
+{
+    if (g_app == nullptr || g_app->activeHotkeyIndex < 0 ||
+        static_cast<size_t>(g_app->activeHotkeyIndex) >= kHotkeyCount)
+    {
+        return;
+    }
+
+    if (virtualKey == VK_ESCAPE)
+    {
+        CancelHotkeyCapture(window);
+        return;
+    }
+    if (IsHotkeyModifierKey(virtualKey))
+    {
+        return;
+    }
+
+    const size_t index = static_cast<size_t>(g_app->activeHotkeyIndex);
+    const HotkeyBinding candidate{CurrentHotkeyModifiers(), virtualKey};
+    const HotkeyBinding original = g_app->hotkeyCaptureOriginal;
+
+    UnregisterGlobalHotkeys(window);
+    g_app->hotkeys[index] = candidate;
+    if (!RegisterGlobalHotkeys(window))
+    {
+        // A system-reserved or duplicate binding must not leave the app with
+        // a partially registered shortcut set.
+        UnregisterGlobalHotkeys(window);
+        g_app->hotkeys[index] = original;
+        RegisterGlobalHotkeys(window);
+        MessageBeep(MB_ICONWARNING);
+    }
+    else
+    {
+        SaveHotkeyBindings(*g_app);
+    }
+
+    g_app->activeHotkeyIndex = -1;
+    RefreshHotkeyControlLabels();
+    SetFocus(window);
+    UpdateDisplay();
+}
+
+void ShowSettingsPage(bool show)
+{
+    if (g_app == nullptr || g_app->mainWindow == nullptr)
+    {
+        return;
+    }
+
+    if (!show && g_app->activeHotkeyIndex >= 0)
+    {
+        CancelHotkeyCapture(g_app->mainWindow);
+    }
+
+    g_app->settingsVisible = show;
+
+    const int mainControlIds[] = {
+        kCommandCaptureFirst,
+        kCommandCaptureSecond,
+        kCommandToggleOverlay,
+        kCommandToggleClickThrough,
+        kCommandCopyDistance,
+    };
+    for (const int id : mainControlIds)
+    {
+        ShowWindow(
+            GetDlgItem(g_app->mainWindow, id),
+            show ? SW_HIDE : SW_SHOW);
+    }
+
+    ShowWindow(g_app->settingsButton, show ? SW_HIDE : SW_SHOW);
+    ShowWindow(g_app->settingsBackButton, show ? SW_SHOW : SW_HIDE);
+    for (const HWND control : g_app->hotkeyControls)
+    {
+        ShowWindow(control, show ? SW_SHOW : SW_HIDE);
+    }
+
+    InvalidateRect(g_app->mainWindow, nullptr, TRUE);
+    if (show)
+    {
+        SetFocus(g_app->mainWindow);
+    }
+}
+
+bool HandleHotkeyCaptureKey(HWND window, UINT virtualKey)
+{
+    if (g_app == nullptr || !g_app->settingsVisible ||
+        g_app->activeHotkeyIndex < 0)
+    {
+        return false;
+    }
+
+    CompleteHotkeyCapture(window, virtualKey);
+    return true;
 }
 
 // A small shared palette keeps the utility and HUD visually consistent.
@@ -1583,71 +2451,85 @@ std::wstring BearingValue()
     return g_app->bearing ? FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection : L"\u2014";
 }
 
-std::wstring GuideValue(bool compact)
-{
-    const auto range = CurrentRangeTargetMeters();
-    if (!range) return L"Capture two positions to calculate a solution";
-    const auto reference = NearestRangeReference(*range);
-    if (!reference) return L"Outside L81 range  \u00b7  132\u2013684 m";
-    return L"RNG " + FormatNumber(*reference, 0) + L"M" +
-        (compact ? L"  \u00b7  Align with red guide" : L"  \u00b7  Align this line with the red guide");
-}
-
 void CreateMainControls(HWND window)
 {
     g_app->uiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    auto button = [&](int id, const wchar_t* label, int x, int y, int w, int h) {
+    auto button = [&](int id, const wchar_t* label, int x, int y, int w, int h) -> HWND {
         HWND control = CreateWindowW(L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
             x, y, w, h, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app->instance, nullptr);
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
+        return control;
     };
-    button(kCommandCaptureFirst, L"Capture player", 16, 241, 170, 34);
-    button(kCommandCaptureSecond, L"Capture target", 198, 241, 170, 34);
-    button(kCommandToggleOverlay, L"Overlay", 16, 313, 100, 32);
-    button(kCommandToggleClickThrough, L"Click-through", 124, 313, 142, 32);
-    button(kCommandCopyDistance, L"Copy distance  \u00b7  Ctrl+Alt+C", 164, 398, 204, 28);
-    g_app->rangeScaleEdit = CreateWindowExW(0, L"EDIT", L"100.0",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-        286, 319, 72, 22, window,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kControlRangeScale)), g_app->instance, nullptr);
-    SendMessageW(g_app->rangeScaleEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
-    SendMessageW(g_app->rangeScaleEdit, EM_SETLIMITTEXT, 12, 0);
+    g_app->settingsButton = button(kCommandSettings, L"\u2699", 344, 8, 40, 34);
+    g_app->settingsBackButton = button(kCommandSettingsBack, L"Back", 16, 8, 52, 34);
+
+    button(kCommandCaptureFirst, L"Capture player", 16, 220, 170, 36);
+    button(kCommandCaptureSecond, L"Capture target", 198, 220, 170, 36);
+    button(kCommandToggleOverlay, L"Overlay", 16, 278, 100, 32);
+    button(kCommandToggleClickThrough, L"Click-through", 124, 278, 142, 32);
+    button(kCommandCopyDistance, L"Copy distance", 16, 326, 352, 32);
+
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        const std::wstring label = FormatHotkey(g_app->hotkeys[index]);
+        g_app->hotkeyControls[index] = button(
+            kCommandHotkeyBase + static_cast<int>(index),
+            label.c_str(),
+            190,
+            76 + static_cast<int>(index) * 48,
+            178,
+            32);
+    }
+
     BOOL dark = TRUE;
     DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
     COLORREF caption = kBackground;
     DwmSetWindowAttribute(window, 35, &caption, sizeof(caption));
 }
 
+void PaintSettings(HDC dc)
+{
+    UiText(dc, L"Settings", {82, 12, 330, 43}, 21, kText, FW_SEMIBOLD);
+    UiText(dc, L"Keyboard shortcuts", {18, 55, 368, 76}, 11, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"Click a shortcut, then press the key combination to assign it.",
+        {18, 350, 382, 374}, 11, kMuted);
+    for (size_t index = 0; index < kHotkeyCount; ++index)
+    {
+        const int top = 76 + static_cast<int>(index) * 48;
+        UiText(
+            dc,
+            kHotkeyActionLabels[index],
+            {18, top, 180, top + 32},
+            12,
+            kText,
+            FW_NORMAL,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+}
+
 void PaintMain(HDC dc)
 {
+    if (g_app != nullptr && g_app->settingsVisible)
+    {
+        PaintSettings(dc);
+        return;
+    }
+
     UiText(dc, L"\u2295", {16, 13, 47, 48}, 30, kMint);
-    UiText(dc, L"WAR DOGS", {55, 14, 240, 47}, 21, kText, FW_SEMIBOLD);
-    UiText(dc, g_app->targetWindow ? L"\u2022  CONNECTED" : L"\u2022  OFFLINE",
-        {245, 16, 368, 46}, 10, g_app->targetWindow ? kMint : kMuted,
-        FW_NORMAL, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    UiText(dc, L"Arty Buddy", {55, 14, 300, 47}, 21, kText, FW_SEMIBOLD);
     UiText(dc, L"RANGE", {18, 63, 182, 82}, 10, kMuted, FW_SEMIBOLD);
     UiText(dc, L"BEARING", {200, 63, 366, 82}, 10, kMuted, FW_SEMIBOLD);
     UiText(dc, RangeValue(), {16, 83, 190, 131}, 34, kText, FW_SEMIBOLD);
     UiText(dc, BearingValue(), {198, 83, 368, 131}, 34, kText, FW_SEMIBOLD);
-    UiText(dc, GuideValue(true), {16, 138, 368, 164}, 12,
-        CurrentRangeTargetMeters() ? kCoral : kMuted);
     for (int i = 0; i < 2; ++i)
     {
         int x = 16 + i * 182;
-        const auto point = i ? g_app->second : g_app->first;
-        UiText(dc, i ? L"TARGET" : L"PLAYER", {x, 181, x+170, 199}, 10, kMuted);
-        UiText(dc, point ? FormatCoordinate(*point) : L"Not captured", {x, 204, x+170, 229}, 14);
-        UiText(dc, i ? L"Ctrl+Alt+2" : L"Ctrl+Alt+1", {x, 278, x+170, 298}, 11, kMuted,
-            FW_NORMAL, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        const auto point = i == 1 ? g_app->second : g_app->first;
+        UiText(dc, i == 1 ? L"TARGET" : L"PLAYER", {x, 157, x+170, 175}, 10, kMuted);
+        UiText(dc, point ? FormatCoordinate(*point) : L"Not captured", {x, 178, x+170, 204}, 14);
     }
-    Card(dc, {274, 313, 368, 345});
-    UiText(dc, L"Ctrl+Alt+O", {16, 347, 116, 366}, 10, kMuted);
-    UiText(dc, L"Ctrl+Alt+T", {124, 347, 266, 366}, 10, kMuted);
-    UiText(dc, L"m / unit", {274, 347, 368, 366}, 10, kMuted);
-    UiText(dc, g_app->status, {16, 374, 368, 395}, 11, kMuted);
-    UiText(dc, L"L81  /  RNG", {16, 403, 145, 421}, 10, kMuted);
 }
 
 void PaintOverlay(HWND window, HDC dc)
@@ -1656,19 +2538,13 @@ void PaintOverlay(HWND window, HDC dc)
     GetClientRect(window, &client);
     Card(dc, client, kBackground);
     const int w = client.right;
-    UiText(dc, L"WAR DOGS", {16, 10, 150, 32}, 13, kText, FW_SEMIBOLD);
-    UiText(dc, g_app->clickThrough ? L"\u2022  LIVE" : L"\u2022  MOUSE ON", {160, 10, w-16, 32}, 11, kMint,
-        FW_NORMAL, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    UiText(dc, L"Arty Buddy", {16, 10, w-16, 32}, 13, kText, FW_SEMIBOLD);
     UiText(dc, RangeValue(), {16, 37, w/2, 82}, 30, kText, FW_SEMIBOLD);
     UiText(dc, BearingValue(), {w/2+8, 37, w-16, 82}, 30, kText, FW_SEMIBOLD);
-    UiText(dc, GuideValue(true), {16, 85, w-16, 108}, 12,
-        CurrentRangeTargetMeters() ? kCoral : kMuted);
-    UiText(dc, L"PLAYER", {16, 117, w/2, 133}, 10, kMuted);
-    UiText(dc, L"TARGET", {w/2+8, 117, w-16, 133}, 10, kMuted);
-    UiText(dc, g_app->first ? FormatCoordinate(*g_app->first) : L"Not captured", {16, 134, w/2, 154}, 12);
-    UiText(dc, g_app->second ? FormatCoordinate(*g_app->second) : L"Not captured", {w/2+8, 134, w-16, 154}, 12);
-    UiText(dc, L"Ctrl+Alt+1", {16, 158, w/2, 177}, 10, kMuted);
-    UiText(dc, L"Ctrl+Alt+2", {w/2+8, 158, w-16, 177}, 10, kMuted);
+    UiText(dc, L"PLAYER", {16, 91, w/2, 107}, 10, kMuted);
+    UiText(dc, L"TARGET", {w/2+8, 91, w-16, 107}, 10, kMuted);
+    UiText(dc, g_app->first ? FormatCoordinate(*g_app->first) : L"Not captured", {16, 108, w/2, 130}, 12);
+    UiText(dc, g_app->second ? FormatCoordinate(*g_app->second) : L"Not captured", {w/2+8, 108, w-16, 130}, 12);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -1752,7 +2628,10 @@ void PaintRangeOverlay(HWND window, HDC dc)
                 markerTop,
                 height - 1);
 
-            HPEN anglePen = CreatePen(PS_SOLID, 3, RGB(255, 55, 55));
+            HPEN anglePen = CreatePen(
+                PS_SOLID,
+                kOverlayGuidePenWidth,
+                RGB(255, 55, 55));
             HPEN previousPen = static_cast<HPEN>(SelectObject(dc, anglePen));
             MoveToEx(dc, guideX, markerTop, nullptr);
             LineTo(dc, guideX, markerBottom);
@@ -1840,7 +2719,10 @@ void PaintRangeOverlay(HWND window, HDC dc)
     const int markerLabelX = barRight + static_cast<int>(
         std::lround(width * kRangeMarkerLabelGapFraction));
 
-    HPEN guidePen = CreatePen(PS_SOLID, 3, RGB(255, 55, 55));
+    HPEN guidePen = CreatePen(
+        PS_SOLID,
+        kOverlayGuidePenWidth,
+        RGB(255, 55, 55));
     HPEN previousPen = static_cast<HPEN>(SelectObject(dc, guidePen));
     MoveToEx(dc, barLeft, guideY, nullptr);
     LineTo(dc, barRight, guideY);
@@ -1936,26 +2818,32 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         EndPaint(window, &paint);
         return 0;
     }
-    case WM_CTLCOLOREDIT:
-        SetTextColor(reinterpret_cast<HDC>(wParam), kText);
-        SetBkColor(reinterpret_cast<HDC>(wParam), kSurface);
-        SetDCBrushColor(reinterpret_cast<HDC>(wParam), kSurface);
-        return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
     case WM_DRAWITEM:
     {
         auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         SetDCBrushColor(item->hDC, kBackground);
         FillRect(item->hDC, &item->rcItem, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
         bool primary = item->CtlID == kCommandCaptureFirst || item->CtlID == kCommandCaptureSecond;
+        const bool settingsControl =
+            item->CtlID == kCommandSettings ||
+            item->CtlID == kCommandSettingsBack ||
+            (item->CtlID >= kCommandHotkeyBase &&
+             item->CtlID < kCommandHotkeyBase + static_cast<int>(kHotkeyCount));
         bool down = (item->itemState & ODS_SELECTED) != 0;
-        Card(item->hDC, item->rcItem, primary ? (down ? RGB(81, 190, 154) : kMint) : kSurface,
-            primary ? kMint : kBorder, 8);
+        Card(
+            item->hDC,
+            item->rcItem,
+            primary ? (down ? RGB(81, 190, 154) : kMint) :
+                (down ? RGB(34, 46, 58) : kSurface),
+            primary ? kMint : (settingsControl ? kMint : kBorder),
+            8);
         wchar_t label[128]{};
         GetWindowTextW(item->hwndItem, label, _countof(label));
         std::wstring text = label;
         if (item->CtlID == kCommandToggleOverlay) text += g_app->overlayEnabled ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleClickThrough) text += g_app->clickThrough ? L"  ON" : L"  OFF";
-        UiText(item->hDC, text, item->rcItem, 12, primary ? kBackground : kText,
+        const int textSize = item->CtlID == kCommandSettings ? 20 : 12;
+        UiText(item->hDC, text, item->rcItem, textSize, primary ? kBackground : kText,
             primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (item->itemState & ODS_FOCUS)
         {
@@ -1974,15 +2862,24 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         return 0;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == kControlRangeScale &&
-            HIWORD(wParam) == EN_CHANGE)
+        if (LOWORD(wParam) >= kCommandHotkeyBase &&
+            LOWORD(wParam) < kCommandHotkeyBase + static_cast<int>(kHotkeyCount) &&
+            HIWORD(wParam) == BN_CLICKED)
         {
-            UpdateDisplay();
+            BeginHotkeyCapture(
+                window,
+                static_cast<size_t>(LOWORD(wParam) - kCommandHotkeyBase));
             return 0;
         }
 
         switch (LOWORD(wParam))
         {
+        case kCommandSettings:
+            ShowSettingsPage(true);
+            return 0;
+        case kCommandSettingsBack:
+            ShowSettingsPage(false);
+            return 0;
         case kCommandCaptureFirst:
             StartOcrCapture(true);
             return 0;
@@ -2007,6 +2904,14 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return 0;
         default:
             break;
+        }
+        break;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if (HandleHotkeyCaptureKey(window, static_cast<UINT>(wParam)))
+        {
+            return 0;
         }
         break;
 
@@ -2135,7 +3040,7 @@ bool CreateOverlayWindow()
     g_app->overlayWindow = CreateWindowExW(
         extendedStyle,
         kOverlayClassName,
-        L"War Dogs Artillery Overlay",
+        L"Arty Buddy Overlay",
         WS_POPUP,
         30,
         30,
@@ -2170,7 +3075,7 @@ bool CreateRangeOverlayWindow()
     g_app->rangeOverlayWindow = CreateWindowExW(
         extendedStyle,
         kRangeOverlayClassName,
-        L"War Dogs Artillery Range Overlay",
+        L"Arty Buddy Range Overlay",
         WS_POPUP,
         0,
         0,
@@ -2210,23 +3115,24 @@ int APIENTRY wWinMain(
 
     AppState state{};
     state.instance = instance;
+    LoadHotkeyBindings(state);
     g_app = &state;
 
     if (!RegisterWindowClasses(instance))
     {
-        MessageBoxW(nullptr, L"Could not register the application windows.", L"War Dogs Artillery", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Could not register the application windows.", L"Arty Buddy", MB_ICONERROR);
         return 1;
     }
 
     state.mainWindow = CreateWindowExW(
         0,
         kMainClassName,
-        L"War Dogs Artillery",
+        L"Arty Buddy",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
         (GetSystemMetrics(SM_CXSCREEN) - 400) / 2,
         (GetSystemMetrics(SM_CYSCREEN) - 476) / 2,
         400,
-        476,
+        420,
         nullptr,
         nullptr,
         instance,
@@ -2234,13 +3140,15 @@ int APIENTRY wWinMain(
 
     if (state.mainWindow == nullptr)
     {
-        MessageBoxW(nullptr, L"Could not create the main window.", L"War Dogs Artillery", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Could not create the main window.", L"Arty Buddy", MB_ICONERROR);
         return 1;
     }
 
+    ShowSettingsPage(false);
+
     if (!CreateOverlayWindow() || !CreateRangeOverlayWindow())
     {
-        MessageBoxW(nullptr, L"Could not create the overlay window.", L"War Dogs Artillery", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Could not create the overlay window.", L"Arty Buddy", MB_ICONERROR);
         DestroyWindow(state.mainWindow);
         return 1;
     }
