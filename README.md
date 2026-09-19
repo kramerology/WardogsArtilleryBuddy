@@ -5,9 +5,9 @@ A native Windows utility that reads two X/Y coordinates from the Wardogs game ma
 ## Workflow
 
 1. Open the in-game map while `WardogsClient-Win64-Shipping.exe` is running.
-2. Press the configured player-capture hotkey or click **Capture player**.
+2. Press the configured player-capture hotkey, click **Capture player**, or enter/paste the player coordinates manually.
 3. Move or mark the target position and leave its coordinate visible on the map.
-4. Press the configured target-capture hotkey or click **Capture target**.
+4. Press the configured target-capture hotkey, click **Capture target**, or enter/paste the target coordinates manually.
 5. The calculated distance appears in the utility and in the topmost overlay.
 6. The direction appears as a bearing plus an 8-point compass label, such as `145° SE`.
 7. Keep the scope in RNG mode. The utility chooses the nearest known RNG line and moves a red horizontal guide bar to the exact offset needed for the calculated range.
@@ -24,6 +24,10 @@ The parser accepts forms such as:
 Direction uses the game's coordinate orientation: positive X is east/right, positive Y is north/up, `0°` is north, and angles increase clockwise.
 
 OCR captures the center portion of the game client, briefly hides the app's layered guides while the screenshot settles, enlarges a focused map-label crop, and then uses thresholded fallback passes plus a broader map capture. The parser scores complete two-decimal pairs, tolerates a missing `x`/`y` glyph, and keeps the best focused/consensus result instead of taking the first number from a noisy pass. A capture attempts to bring the game window to the foreground automatically; Windows OCR must have an installed language recognizer. English is normally provided by the Windows language settings.
+
+## Manual and clipboard input
+
+The main window includes separate X and Y fields for the player and target. Enter numeric values and click **Apply** for either point. The **Paste** buttons read text from the Windows clipboard and accept the same coordinate formats as OCR, including `X = 105.59` / `Y = 110.89`, `X: 105.59, Y: 110.89`, and `105.59, 110.89`. Clipboard input is text-based; copying an image does not provide coordinates.
 
 ## RNG guide
 

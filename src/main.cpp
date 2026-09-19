@@ -73,7 +73,15 @@ constexpr int kCommandToggleClickThrough = 1005;
 constexpr int kCommandExit = 1006;
 constexpr int kCommandSettings = 1007;
 constexpr int kCommandSettingsBack = 1008;
+constexpr int kCommandApplyPlayer = 1009;
+constexpr int kCommandApplyTarget = 1010;
+constexpr int kCommandPastePlayer = 1011;
+constexpr int kCommandPasteTarget = 1012;
 constexpr int kCommandHotkeyBase = 1100;
+constexpr int kControlPlayerX = 1201;
+constexpr int kControlPlayerY = 1202;
+constexpr int kControlTargetX = 1203;
+constexpr int kControlTargetY = 1204;
 constexpr size_t kHotkeyCount = 5;
 
 constexpr wchar_t kSettingsRegistryPath[] = L"Software\\ArtyBuddy";
@@ -201,6 +209,7 @@ struct AppState
     DWORD targetProcessId{};
 
     HFONT uiFont{};
+    HBRUSH inputBrush{};
     std::wstring status{L"Open the map, then capture player and target positions."};
 
     NOTIFYICONDATAW tray{};
@@ -224,8 +233,16 @@ struct AppState
     HotkeyBinding hotkeyCaptureOriginal{};
     std::array<HotkeyBinding, kHotkeyCount> hotkeys{};
     std::array<HWND, kHotkeyCount> hotkeyControls{};
+    HWND playerXEdit{};
+    HWND playerYEdit{};
+    HWND targetXEdit{};
+    HWND targetYEdit{};
     HWND settingsButton{};
     HWND settingsBackButton{};
+    HWND applyPlayerButton{};
+    HWND applyTargetButton{};
+    HWND pastePlayerButton{};
+    HWND pasteTargetButton{};
     std::atomic_bool ocrInProgress{false};
 };
 
@@ -423,6 +440,48 @@ std::wstring FormatCoordinate(const Coordinate& coordinate)
            FormatNumber(coordinate.y, 3);
 }
 
+void SetCoordinateEditValue(HWND edit, const std::optional<double>& value)
+{
+    if (edit == nullptr)
+    {
+        return;
+    }
+
+    const std::wstring text = value.has_value()
+        ? FormatNumber(*value, 3)
+        : L"";
+    SetWindowTextW(edit, text.c_str());
+}
+
+void UpdateCoordinateInputControls()
+{
+    if (g_app == nullptr)
+    {
+        return;
+    }
+
+    SetCoordinateEditValue(
+        g_app->playerXEdit,
+        g_app->first.has_value()
+            ? std::optional<double>(g_app->first->x)
+            : std::nullopt);
+    SetCoordinateEditValue(
+        g_app->playerYEdit,
+        g_app->first.has_value()
+            ? std::optional<double>(g_app->first->y)
+            : std::nullopt);
+    SetCoordinateEditValue(
+        g_app->targetXEdit,
+        g_app->second.has_value()
+            ? std::optional<double>(g_app->second->x)
+            : std::nullopt);
+    SetCoordinateEditValue(
+        g_app->targetYEdit,
+        g_app->second.has_value()
+            ? std::optional<double>(g_app->second->y)
+            : std::nullopt);
+}
+
 double NormalizeAngleDegrees(double angle)
 {
     if (!std::isfinite(angle))
@@ -581,6 +640,57 @@ bool SetClipboardText(const std::wstring& text)
 
     CloseClipboard();
     return true;
+}
+
+std::optional<std::wstring> GetClipboardText()
+{
+    if (!OpenClipboard(g_app != nullptr ? g_app->mainWindow : nullptr))
+    {
+        return std::nullopt;
+    }
+
+    std::optional<std::wstring> result;
+    if (const HANDLE unicodeData = GetClipboardData(CF_UNICODETEXT);
+        unicodeData != nullptr)
+    {
+        const auto* text = static_cast<const wchar_t*>(GlobalLock(unicodeData));
+        if (text != nullptr)
+        {
+            result = std::wstring(text);
+            GlobalUnlock(unicodeData);
+        }
+    }
+    else if (const HANDLE ansiData = GetClipboardData(CF_TEXT); ansiData != nullptr)
+    {
+        const auto* text = static_cast<const char*>(GlobalLock(ansiData));
+        if (text != nullptr)
+        {
+            const int length = MultiByteToWideChar(
+                CP_ACP,
+                MB_PRECOMPOSED,
+                text,
+                -1,
+                nullptr,
+                0);
+            if (length > 0)
+            {
+                std::wstring converted(static_cast<size_t>(length), L'\0');
+                MultiByteToWideChar(
+                    CP_ACP,
+                    MB_PRECOMPOSED,
+                    text,
+                    -1,
+                    converted.data(),
+                    length);
+                converted.resize(static_cast<size_t>(length - 1));
+                result = std::move(converted);
+            }
+            GlobalUnlock(ansiData);
+        }
+    }
+
+    CloseClipboard();
+    return result;
 }
 
 struct OcrNumberToken
@@ -1797,13 +1907,14 @@ void ApplyCapturedCoordinate(bool firstPoint, const Coordinate& coordinate)
         g_app->distance.reset();
         g_app->bearing.reset();
         g_app->compassDirection.clear();
-        SetStatus(L"Captured the player's position. Press Hotkey 2 over the target position.");
+        SetStatus(L"Captured the player's position. Capture or enter the target position.");
+        UpdateCoordinateInputControls();
     }
     else
     {
         if (!g_app->first.has_value())
         {
-            SetStatus(L"Capture the player's position with Hotkey 1 first.");
+            SetStatus(L"Capture or enter the player's position first.");
             MessageBeep(MB_ICONWARNING);
             return;
         }
@@ -1818,6 +1929,7 @@ void ApplyCapturedCoordinate(bool firstPoint, const Coordinate& coordinate)
         SetStatus(
             L"Distance: " + FormatNumber(*g_app->distance, 2) + L" | Direction: " +
             FormatDirection(direction));
+        UpdateCoordinateInputControls();
     }
 
     UpdateDisplay();
@@ -2022,6 +2134,85 @@ void CopyDistance()
         SetStatus(L"Could not write the distance to the clipboard.");
         MessageBeep(MB_ICONWARNING);
     }
+}
+
+std::wstring ReadEditText(HWND edit)
+{
+    if (edit == nullptr)
+    {
+        return {};
+    }
+
+    const int length = GetWindowTextLengthW(edit);
+    std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(edit, buffer.data(), static_cast<int>(buffer.size()));
+    return std::wstring(buffer.data());
+}
+
+std::optional<double> ParseManualCoordinateValue(const std::wstring& text)
+{
+    try
+    {
+        size_t consumed = 0;
+        const double value = std::stod(text, &consumed);
+        if (!std::isfinite(value))
+        {
+            return std::nullopt;
+        }
+
+        if (text.find_first_not_of(L" \t\r\n", consumed) != std::wstring::npos)
+        {
+            return std::nullopt;
+        }
+
+        return value;
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+}
+
+void ApplyManualCoordinate(bool firstPoint)
+{
+    if (g_app == nullptr)
+    {
+        return;
+    }
+
+    const HWND xEdit = firstPoint ? g_app->playerXEdit : g_app->targetXEdit;
+    const HWND yEdit = firstPoint ? g_app->playerYEdit : g_app->targetYEdit;
+    const auto x = ParseManualCoordinateValue(ReadEditText(xEdit));
+    const auto y = ParseManualCoordinateValue(ReadEditText(yEdit));
+    if (!x.has_value() || !y.has_value())
+    {
+        SetStatus(L"Enter valid numeric X and Y coordinates.");
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    ApplyCapturedCoordinate(firstPoint, Coordinate{*x, *y});
+}
+
+void ApplyClipboardCoordinate(bool firstPoint)
+{
+    const auto text = GetClipboardText();
+    if (!text.has_value())
+    {
+        SetStatus(L"Could not read text from the clipboard.");
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    const auto coordinate = ParseOcrCoordinate(*text);
+    if (!coordinate.has_value())
+    {
+        SetStatus(L"Clipboard text did not contain a valid X/Y coordinate pair.");
+        MessageBeep(MB_ICONWARNING);
+        return;
+    }
+
+    ApplyCapturedCoordinate(firstPoint, *coordinate);
 }
 
 void ApplyOverlayHitTesting()
@@ -2370,12 +2561,30 @@ void ShowSettingsPage(bool show)
         kCommandToggleOverlay,
         kCommandToggleClickThrough,
         kCommandCopyDistance,
+        kCommandApplyPlayer,
+        kCommandApplyTarget,
+        kCommandPastePlayer,
+        kCommandPasteTarget,
     };
     for (const int id : mainControlIds)
     {
         ShowWindow(
             GetDlgItem(g_app->mainWindow, id),
             show ? SW_HIDE : SW_SHOW);
+    }
+
+    const HWND coordinateEdits[] = {
+        g_app->playerXEdit,
+        g_app->playerYEdit,
+        g_app->targetXEdit,
+        g_app->targetYEdit,
+    };
+    for (const HWND edit : coordinateEdits)
+    {
+        if (edit != nullptr)
+        {
+            ShowWindow(edit, show ? SW_HIDE : SW_SHOW);
+        }
     }
 
     ShowWindow(g_app->settingsButton, show ? SW_HIDE : SW_SHOW);
@@ -2456,20 +2665,47 @@ void CreateMainControls(HWND window)
     g_app->uiFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    g_app->inputBrush = CreateSolidBrush(kSurface);
     auto button = [&](int id, const wchar_t* label, int x, int y, int w, int h) -> HWND {
         HWND control = CreateWindowW(L"BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
             x, y, w, h, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_app->instance, nullptr);
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
         return control;
     };
+    auto edit = [&](int id, int x, int y, int w, int h) -> HWND {
+        HWND control = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            x,
+            y,
+            w,
+            h,
+            window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            g_app->instance,
+            nullptr);
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
+        return control;
+    };
     g_app->settingsButton = button(kCommandSettings, L"\u2699", 344, 8, 40, 34);
     g_app->settingsBackButton = button(kCommandSettingsBack, L"Back", 16, 8, 52, 34);
 
-    button(kCommandCaptureFirst, L"Capture player", 16, 220, 170, 36);
-    button(kCommandCaptureSecond, L"Capture target", 198, 220, 170, 36);
-    button(kCommandToggleOverlay, L"Overlay", 16, 278, 100, 32);
-    button(kCommandToggleClickThrough, L"Click-through", 124, 278, 142, 32);
-    button(kCommandCopyDistance, L"Copy distance", 16, 326, 352, 32);
+    g_app->playerXEdit = edit(kControlPlayerX, 30, 258, 70, 28);
+    g_app->playerYEdit = edit(kControlPlayerY, 126, 258, 70, 28);
+    g_app->targetXEdit = edit(kControlTargetX, 30, 322, 70, 28);
+    g_app->targetYEdit = edit(kControlTargetY, 126, 322, 70, 28);
+    g_app->pastePlayerButton = button(kCommandPastePlayer, L"Paste", 206, 256, 80, 32);
+    g_app->applyPlayerButton = button(kCommandApplyPlayer, L"Apply", 294, 256, 84, 32);
+    g_app->pasteTargetButton = button(kCommandPasteTarget, L"Paste", 206, 320, 80, 32);
+    g_app->applyTargetButton = button(kCommandApplyTarget, L"Apply", 294, 320, 84, 32);
+
+    button(kCommandCaptureFirst, L"Capture player", 16, 370, 170, 36);
+    button(kCommandCaptureSecond, L"Capture target", 198, 370, 170, 36);
+    button(kCommandToggleOverlay, L"Overlay", 16, 428, 100, 32);
+    button(kCommandToggleClickThrough, L"Click-through", 124, 428, 142, 32);
+    button(kCommandCopyDistance, L"Copy distance", 16, 468, 352, 32);
 
     for (size_t index = 0; index < kHotkeyCount; ++index)
     {
@@ -2482,6 +2718,8 @@ void CreateMainControls(HWND window)
             178,
             32);
     }
+
+    UpdateCoordinateInputControls();
 
     BOOL dark = TRUE;
     DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
@@ -2530,6 +2768,18 @@ void PaintMain(HDC dc)
         UiText(dc, i == 1 ? L"TARGET" : L"PLAYER", {x, 157, x+170, 175}, 10, kMuted);
         UiText(dc, point ? FormatCoordinate(*point) : L"Not captured", {x, 178, x+170, 204}, 14);
     }
+
+    UiText(dc, L"MANUAL / CLIPBOARD", {18, 214, 382, 233}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"PLAYER", {16, 236, 100, 254}, 10, kMuted);
+    UiText(dc, L"X", {16, 258, 29, 286}, 11, kMuted, FW_SEMIBOLD,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    UiText(dc, L"Y", {112, 258, 125, 286}, 11, kMuted, FW_SEMIBOLD,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    UiText(dc, L"TARGET", {16, 300, 100, 318}, 10, kMuted);
+    UiText(dc, L"X", {16, 322, 29, 350}, 11, kMuted, FW_SEMIBOLD,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    UiText(dc, L"Y", {112, 322, 125, 350}, 11, kMuted, FW_SEMIBOLD,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 void PaintOverlay(HWND window, HDC dc)
@@ -2823,7 +3073,10 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         SetDCBrushColor(item->hDC, kBackground);
         FillRect(item->hDC, &item->rcItem, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        bool primary = item->CtlID == kCommandCaptureFirst || item->CtlID == kCommandCaptureSecond;
+        bool primary = item->CtlID == kCommandCaptureFirst ||
+            item->CtlID == kCommandCaptureSecond ||
+            item->CtlID == kCommandApplyPlayer ||
+            item->CtlID == kCommandApplyTarget;
         const bool settingsControl =
             item->CtlID == kCommandSettings ||
             item->CtlID == kCommandSettingsBack ||
@@ -2853,6 +3106,19 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         }
         return TRUE;
     }
+    case WM_CTLCOLOREDIT:
+        if (g_app != nullptr && g_app->inputBrush != nullptr)
+        {
+            const HWND edit = reinterpret_cast<HWND>(lParam);
+            if (edit == g_app->playerXEdit || edit == g_app->playerYEdit ||
+                edit == g_app->targetXEdit || edit == g_app->targetYEdit)
+            {
+                SetTextColor(reinterpret_cast<HDC>(wParam), kText);
+                SetBkColor(reinterpret_cast<HDC>(wParam), kSurface);
+                return reinterpret_cast<LRESULT>(g_app->inputBrush);
+            }
+        }
+        break;
     case kOcrResultMessage:
         HandleOcrResult(reinterpret_cast<OcrResult*>(lParam));
         return 0;
@@ -2885,6 +3151,18 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return 0;
         case kCommandCaptureSecond:
             StartOcrCapture(false);
+            return 0;
+        case kCommandApplyPlayer:
+            ApplyManualCoordinate(true);
+            return 0;
+        case kCommandApplyTarget:
+            ApplyManualCoordinate(false);
+            return 0;
+        case kCommandPastePlayer:
+            ApplyClipboardCoordinate(true);
+            return 0;
+        case kCommandPasteTarget:
+            ApplyClipboardCoordinate(false);
             return 0;
         case kCommandToggleOverlay:
             ToggleOverlay();
@@ -3130,9 +3408,9 @@ int APIENTRY wWinMain(
         L"Arty Buddy",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
         (GetSystemMetrics(SM_CXSCREEN) - 400) / 2,
-        (GetSystemMetrics(SM_CYSCREEN) - 476) / 2,
+        (GetSystemMetrics(SM_CYSCREEN) - 560) / 2,
         400,
-        420,
+        560,
         nullptr,
         nullptr,
         instance,
@@ -3174,6 +3452,7 @@ int APIENTRY wWinMain(
     }
 
     DeleteObject(state.uiFont);
+    DeleteObject(state.inputBrush);
     g_app = nullptr;
     return static_cast<int>(message.wParam);
 }
