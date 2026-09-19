@@ -32,4 +32,22 @@ target_link_libraries(WarDogsArtillery PRIVATE
     Shell32
     User32
     WindowsApp
+    Winhttp
+)
+
+add_executable(ArtyBuddyUpdater WIN32
+    src/updater.cpp
+)
+
+target_compile_features(ArtyBuddyUpdater PRIVATE cxx_std_20)
+
+if (MSVC)
+    target_compile_options(ArtyBuddyUpdater PRIVATE /W4 /permissive-)
+    set_property(TARGET ArtyBuddyUpdater PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
+target_link_libraries(ArtyBuddyUpdater PRIVATE
+    Shell32
+    User32
 )

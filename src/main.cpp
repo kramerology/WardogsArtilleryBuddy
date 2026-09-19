@@ -12,8 +12,10 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <dwmapi.h>
+#include <winhttp.h>
 
 #include <winrt/base.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Graphics.Imaging.h>
@@ -45,6 +47,7 @@
 #pragma comment(lib, "WindowsApp.lib")
 #pragma comment(lib, "Dwmapi.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Winhttp.lib")
 
 namespace
 {
@@ -57,7 +60,12 @@ constexpr UINT kTrayId = 1;
 constexpr UINT_PTR kGamePollTimer = 1;
 constexpr UINT kGamePollIntervalMs = 250;
 constexpr UINT kOcrResultMessage = WM_APP + 2;
+constexpr UINT kUpdateCheckMessage = WM_APP + 3;
+constexpr UINT kUpdateDownloadMessage = WM_APP + 4;
 constexpr wchar_t kTargetProcessName[] = L"WardogsClient-Win64-Shipping.exe";
+constexpr wchar_t kCurrentVersion[] = L"0.0.3";
+constexpr wchar_t kLatestReleaseApiUrl[] =
+    L"https://api.github.com/repos/kramerology/WardogsArtilleryBuddy/releases/latest";
 
 constexpr int kHotkeyFirst = 1;
 constexpr int kHotkeySecond = 2;
@@ -77,6 +85,7 @@ constexpr int kCommandApplyPlayer = 1009;
 constexpr int kCommandApplyTarget = 1010;
 constexpr int kCommandPastePlayer = 1011;
 constexpr int kCommandPasteTarget = 1012;
+constexpr int kCommandToggleAutoUpdate = 1013;
 constexpr int kCommandHotkeyBase = 1100;
 constexpr int kControlPlayerX = 1201;
 constexpr int kControlPlayerY = 1202;
@@ -85,6 +94,7 @@ constexpr int kControlTargetY = 1204;
 constexpr size_t kHotkeyCount = 5;
 
 constexpr wchar_t kSettingsRegistryPath[] = L"Software\\ArtyBuddy";
+constexpr wchar_t kAutoUpdateRegistryName[] = L"AutoUpdateEnabled";
 constexpr const wchar_t* kHotkeyRegistryNames[] = {
     L"CapturePlayerModifiers",
     L"CapturePlayerKey",
@@ -226,6 +236,7 @@ struct AppState
     bool overlayEnabled{true};
     bool overlayVisible{false};
     bool clickThrough{true};
+    bool autoUpdateEnabled{true};
     bool closing{false};
     bool settingsVisible{false};
     bool hotkeysRegistered{false};
@@ -243,6 +254,9 @@ struct AppState
     HWND applyTargetButton{};
     HWND pastePlayerButton{};
     HWND pasteTargetButton{};
+    HWND autoUpdateButton{};
+    std::atomic_bool updateCheckInProgress{false};
+    std::atomic_bool updateDownloadInProgress{false};
     std::atomic_bool ocrInProgress{false};
 };
 
@@ -271,6 +285,7 @@ bool IsValidHotkeyBinding(const HotkeyBinding& binding)
 void LoadHotkeyBindings(AppState& state)
 {
     state.hotkeys = DefaultHotkeyBindings();
+    state.autoUpdateEnabled = true;
 
     HKEY key = nullptr;
     if (RegOpenKeyExW(
@@ -317,6 +332,20 @@ void LoadHotkeyBindings(AppState& state)
         }
     }
 
+    DWORD autoUpdateEnabled = 1;
+    DWORD autoUpdateEnabledSize = sizeof(autoUpdateEnabled);
+    if (RegGetValueW(
+            key,
+            nullptr,
+            kAutoUpdateRegistryName,
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &autoUpdateEnabled,
+            &autoUpdateEnabledSize) == ERROR_SUCCESS)
+    {
+        state.autoUpdateEnabled = autoUpdateEnabled != 0;
+    }
+
     RegCloseKey(key);
 }
 
@@ -357,6 +386,15 @@ void SaveHotkeyBindings(const AppState& state)
             reinterpret_cast<const BYTE*>(&virtualKey),
             sizeof(virtualKey));
     }
+
+    const DWORD autoUpdateEnabled = state.autoUpdateEnabled ? 1u : 0u;
+    RegSetValueExW(
+        key,
+        kAutoUpdateRegistryName,
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&autoUpdateEnabled),
+        sizeof(autoUpdateEnabled));
 
     RegCloseKey(key);
 }
@@ -1238,6 +1276,10 @@ void UpdateDisplay()
     {
         InvalidateRect(g_app->settingsBackButton, nullptr, TRUE);
     }
+    if (g_app->autoUpdateButton != nullptr)
+    {
+        InvalidateRect(g_app->autoUpdateButton, nullptr, TRUE);
+    }
     for (const HWND control : g_app->hotkeyControls)
     {
         if (control != nullptr)
@@ -1786,32 +1828,32 @@ winrt::Windows::Graphics::Imaging::SoftwareBitmap MakeSoftwareBitmap(
         BitmapAlphaMode::Ignore);
 }
 
+struct WinrtApartmentGuard
+{
+    bool initialized{false};
+
+    WinrtApartmentGuard()
+    {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        initialized = true;
+    }
+
+    ~WinrtApartmentGuard()
+    {
+        if (initialized)
+        {
+            winrt::uninit_apartment();
+        }
+    }
+};
+
 OcrRecognition RecognizeImageText(
     const CapturedImage& image,
     std::wstring& error)
 {
-    struct ApartmentGuard
-    {
-        bool initialized{false};
-
-        ApartmentGuard()
-        {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            initialized = true;
-        }
-
-        ~ApartmentGuard()
-        {
-            if (initialized)
-            {
-                winrt::uninit_apartment();
-            }
-        }
-    };
-
     try
     {
-        ApartmentGuard apartment;
+        WinrtApartmentGuard apartment;
         auto engine = winrt::Windows::Media::Ocr::OcrEngine::TryCreateFromUserProfileLanguages();
         if (engine == nullptr)
         {
@@ -2215,6 +2257,772 @@ void ApplyClipboardCoordinate(bool firstPoint)
     ApplyCapturedCoordinate(firstPoint, *coordinate);
 }
 
+struct SemanticVersion
+{
+    int major{};
+    int minor{};
+    int patch{};
+};
+
+bool IsNewerVersion(const SemanticVersion& candidate, const SemanticVersion& current)
+{
+    if (candidate.major != current.major)
+    {
+        return candidate.major > current.major;
+    }
+    if (candidate.minor != current.minor)
+    {
+        return candidate.minor > current.minor;
+    }
+    return candidate.patch > current.patch;
+}
+
+std::optional<SemanticVersion> ParseSemanticVersion(const std::wstring& value)
+{
+    static const std::wregex pattern(
+        LR"(^[vV]?([0-9]+)\.([0-9]+)\.([0-9]+)(?:[-+].*)?$)");
+    std::wsmatch match;
+    if (!std::regex_match(value, match, pattern))
+    {
+        return std::nullopt;
+    }
+
+    try
+    {
+        const long long major = std::stoll(match[1].str());
+        const long long minor = std::stoll(match[2].str());
+        const long long patch = std::stoll(match[3].str());
+        const long long maximum = std::numeric_limits<int>::max();
+        if (major > maximum || minor > maximum || patch > maximum)
+        {
+            return std::nullopt;
+        }
+
+        return SemanticVersion{
+            static_cast<int>(major),
+            static_cast<int>(minor),
+            static_cast<int>(patch)};
+    }
+    catch (const std::exception&)
+    {
+        return std::nullopt;
+    }
+}
+
+struct WinHttpHandle
+{
+    HINTERNET value{};
+
+    ~WinHttpHandle()
+    {
+        if (value != nullptr)
+        {
+            WinHttpCloseHandle(value);
+        }
+    }
+
+    operator HINTERNET() const
+    {
+        return value;
+    }
+};
+
+constexpr size_t kMaximumUpdateDownloadBytes = 64u * 1024u * 1024u;
+
+bool HttpGetBytes(
+    const std::wstring& url,
+    std::vector<std::uint8_t>& response,
+    std::wstring& error)
+{
+    std::wstring mutableUrl = url;
+    URL_COMPONENTS components{};
+    components.dwStructSize = sizeof(components);
+    components.dwSchemeLength = static_cast<DWORD>(-1);
+    components.dwHostNameLength = static_cast<DWORD>(-1);
+    components.dwUrlPathLength = static_cast<DWORD>(-1);
+    components.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(
+            mutableUrl.data(),
+            static_cast<DWORD>(mutableUrl.size()),
+            0,
+            &components))
+    {
+        error = L"Could not parse the GitHub update URL.";
+        return false;
+    }
+
+    if (components.nScheme != INTERNET_SCHEME_HTTPS)
+    {
+        error = L"The GitHub update URL was not HTTPS.";
+        return false;
+    }
+
+    const std::wstring host(
+        components.lpszHostName,
+        components.dwHostNameLength);
+    std::wstring path(
+        components.lpszUrlPath,
+        components.dwUrlPathLength);
+    if (components.dwExtraInfoLength > 0)
+    {
+        path.append(components.lpszExtraInfo, components.dwExtraInfoLength);
+    }
+    if (path.empty())
+    {
+        path = L"/";
+    }
+
+    const std::wstring userAgent = L"ArtyBuddy/" + std::wstring(kCurrentVersion);
+    WinHttpHandle session{
+        WinHttpOpen(
+            userAgent.c_str(),
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            0)};
+    if (session.value == nullptr)
+    {
+        error = L"Could not start the Windows HTTP client.";
+        return false;
+    }
+
+    WinHttpHandle connection{
+        WinHttpConnect(
+            session,
+            host.c_str(),
+            components.nPort,
+            0)};
+    if (connection.value == nullptr)
+    {
+        error = L"Could not connect to GitHub.";
+        return false;
+    }
+
+    WinHttpHandle request{
+        WinHttpOpenRequest(
+            connection,
+            L"GET",
+            path.c_str(),
+            nullptr,
+            WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            WINHTTP_FLAG_SECURE)};
+    if (request.value == nullptr)
+    {
+        error = L"Could not create the GitHub request.";
+        return false;
+    }
+
+    const std::wstring headers =
+        L"Accept: application/vnd.github+json\r\nUser-Agent: " + userAgent + L"\r\n";
+    if (!WinHttpSendRequest(
+            request,
+            headers.c_str(),
+            static_cast<DWORD>(-1),
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            0,
+            0) ||
+        !WinHttpReceiveResponse(request, nullptr))
+    {
+        error = L"The GitHub request could not be completed.";
+        return false;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusSize,
+            WINHTTP_NO_HEADER_INDEX) ||
+        statusCode != HTTP_STATUS_OK)
+    {
+        error = L"GitHub returned HTTP " + std::to_wstring(statusCode) + L".";
+        return false;
+    }
+
+    DWORD contentLength = 0;
+    DWORD contentLengthSize = sizeof(contentLength);
+    if (WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &contentLength,
+            &contentLengthSize,
+            WINHTTP_NO_HEADER_INDEX) &&
+        contentLength > kMaximumUpdateDownloadBytes)
+    {
+        error = L"The GitHub update is unexpectedly large.";
+        return false;
+    }
+
+    response.clear();
+    if (contentLength > 0)
+    {
+        response.reserve(contentLength);
+    }
+
+    for (;;)
+    {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available))
+        {
+            error = L"Could not read the GitHub response.";
+            return false;
+        }
+        if (available == 0)
+        {
+            break;
+        }
+        if (response.size() + available > kMaximumUpdateDownloadBytes)
+        {
+            error = L"The GitHub update is unexpectedly large.";
+            return false;
+        }
+
+        const size_t previousSize = response.size();
+        response.resize(previousSize + available);
+        DWORD bytesRead = 0;
+        if (!WinHttpReadData(
+                request,
+                response.data() + previousSize,
+                available,
+                &bytesRead))
+        {
+            error = L"Could not download the GitHub update.";
+            return false;
+        }
+        response.resize(previousSize + bytesRead);
+        if (bytesRead == 0)
+        {
+            break;
+        }
+    }
+
+    return true;
+}
+
+std::optional<std::wstring> Utf8ToWide(const std::vector<std::uint8_t>& bytes)
+{
+    if (bytes.empty())
+    {
+        return std::nullopt;
+    }
+
+    if (bytes.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
+    {
+        return std::nullopt;
+    }
+
+    const int byteCount = static_cast<int>(bytes.size());
+    const int characterCount = MultiByteToWideChar(
+        CP_UTF8,
+        MB_ERR_INVALID_CHARS,
+        reinterpret_cast<const char*>(bytes.data()),
+        byteCount,
+        nullptr,
+        0);
+    if (characterCount <= 0)
+    {
+        return std::nullopt;
+    }
+
+    std::wstring result(static_cast<size_t>(characterCount), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8,
+            MB_ERR_INVALID_CHARS,
+            reinterpret_cast<const char*>(bytes.data()),
+            byteCount,
+            result.data(),
+            characterCount) != characterCount)
+    {
+        return std::nullopt;
+    }
+
+    return result;
+}
+
+bool EndsWithCaseInsensitive(const std::wstring& value, const wchar_t* suffix)
+{
+    const size_t suffixLength = wcslen(suffix);
+    return value.size() >= suffixLength &&
+        _wcsicmp(
+            value.c_str() + value.size() - suffixLength,
+            suffix) == 0;
+}
+
+struct LatestReleaseInfo
+{
+    SemanticVersion version{};
+    std::wstring tag;
+    std::wstring assetName;
+    std::wstring assetUrl;
+};
+
+bool FetchLatestRelease(LatestReleaseInfo& release, std::wstring& error)
+{
+    std::vector<std::uint8_t> response;
+    if (!HttpGetBytes(kLatestReleaseApiUrl, response, error))
+    {
+        return false;
+    }
+
+    const auto jsonText = Utf8ToWide(response);
+    if (!jsonText.has_value())
+    {
+        error = L"GitHub returned invalid UTF-8 JSON.";
+        return false;
+    }
+
+    try
+    {
+        const auto json = winrt::Windows::Data::Json::JsonObject::Parse(
+            winrt::hstring(*jsonText));
+        if (json.GetNamedBoolean(L"draft", false) ||
+            json.GetNamedBoolean(L"prerelease", false))
+        {
+            error = L"GitHub's latest release is not a stable release.";
+            return false;
+        }
+
+        release.tag = json.GetNamedString(L"tag_name", L"").c_str();
+        const auto version = ParseSemanticVersion(release.tag);
+        if (!version.has_value())
+        {
+            error = L"GitHub's latest release has an invalid version tag.";
+            return false;
+        }
+        release.version = *version;
+
+        const auto assets = json.GetNamedArray(L"assets");
+        std::wstring fallbackName;
+        std::wstring fallbackUrl;
+        for (const auto& value : assets)
+        {
+            const auto asset = value.GetObject();
+            const std::wstring name = asset.GetNamedString(L"name", L"").c_str();
+            const std::wstring url = asset.GetNamedString(
+                L"browser_download_url",
+                L"").c_str();
+            if (!EndsWithCaseInsensitive(name, L".exe") || url.empty())
+            {
+                continue;
+            }
+
+            if (fallbackUrl.empty())
+            {
+                fallbackName = name;
+                fallbackUrl = url;
+            }
+            if (name.find(L"ArtyBuddy") != std::wstring::npos ||
+                name.find(L"WarDogsArtillery") != std::wstring::npos)
+            {
+                release.assetName = name;
+                release.assetUrl = url;
+                break;
+            }
+        }
+
+        if (release.assetUrl.empty() && !fallbackUrl.empty())
+        {
+            release.assetName = fallbackName;
+            release.assetUrl = fallbackUrl;
+        }
+        if (release.assetUrl.empty() ||
+            release.assetUrl.rfind(L"https://", 0) != 0)
+        {
+            error = L"GitHub's latest release has no HTTPS Windows executable asset.";
+            return false;
+        }
+    }
+    catch (const winrt::hresult_error& exception)
+    {
+        error = L"Could not parse GitHub's latest release: ";
+        error += exception.message().c_str();
+        return false;
+    }
+
+    return true;
+}
+
+struct UpdateCheckResult
+{
+    bool updateAvailable{};
+    std::wstring version;
+    std::wstring downloadUrl;
+    std::wstring error;
+};
+
+struct UpdateDownloadResult
+{
+    bool succeeded{};
+    std::wstring version;
+    std::wstring tempPath;
+    std::wstring error;
+};
+
+std::optional<std::wstring> CreateUpdateTempPath()
+{
+    wchar_t tempDirectory[MAX_PATH]{};
+    const DWORD directoryLength = GetTempPathW(
+        _countof(tempDirectory),
+        tempDirectory);
+    if (directoryLength == 0 || directoryLength >= _countof(tempDirectory))
+    {
+        return std::nullopt;
+    }
+
+    wchar_t tempFile[MAX_PATH]{};
+    if (GetTempFileNameW(
+            tempDirectory,
+            L"art",
+            0,
+            tempFile) == 0)
+    {
+        return std::nullopt;
+    }
+
+    DeleteFileW(tempFile);
+    return std::wstring(tempFile);
+}
+
+bool WriteBinaryFile(
+    const std::wstring& path,
+    const std::vector<std::uint8_t>& bytes,
+    std::wstring& error)
+{
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        error = L"Could not create the temporary update file.";
+        return false;
+    }
+
+    bool succeeded = true;
+    size_t offset = 0;
+    while (offset < bytes.size())
+    {
+        const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(
+            bytes.size() - offset,
+            std::numeric_limits<DWORD>::max()));
+        DWORD written = 0;
+        if (!WriteFile(
+                file,
+                bytes.data() + offset,
+                chunkSize,
+                &written,
+                nullptr) ||
+            written != chunkSize)
+        {
+            succeeded = false;
+            break;
+        }
+        offset += written;
+    }
+
+    if (succeeded && !FlushFileBuffers(file))
+    {
+        succeeded = false;
+    }
+    CloseHandle(file);
+
+    if (!succeeded)
+    {
+        DeleteFileW(path.c_str());
+        error = L"Could not save the downloaded update.";
+    }
+    return succeeded;
+}
+
+bool DownloadUpdate(
+    const std::wstring& url,
+    const std::wstring& path,
+    std::wstring& error)
+{
+    std::vector<std::uint8_t> bytes;
+    if (!HttpGetBytes(url, bytes, error))
+    {
+        return false;
+    }
+    if (bytes.size() < 2 || bytes[0] != 'M' || bytes[1] != 'Z')
+    {
+        error = L"GitHub did not return a Windows executable.";
+        return false;
+    }
+
+    return WriteBinaryFile(path, bytes, error);
+}
+
+void StartUpdateCheck()
+{
+    if (g_app == nullptr || !g_app->autoUpdateEnabled ||
+        g_app->updateCheckInProgress.exchange(true))
+    {
+        return;
+    }
+
+    const HWND mainWindow = g_app->mainWindow;
+    std::thread([mainWindow]()
+    {
+        auto result = std::make_unique<UpdateCheckResult>();
+        try
+        {
+            WinrtApartmentGuard apartment;
+            LatestReleaseInfo latest;
+            if (!FetchLatestRelease(latest, result->error))
+            {
+                // Update checks are intentionally quiet when GitHub is
+                // unavailable; the app remains fully usable offline.
+            }
+            else
+            {
+                const auto current = ParseSemanticVersion(kCurrentVersion);
+                if (current.has_value() && IsNewerVersion(latest.version, *current))
+                {
+                    result->updateAvailable = true;
+                    result->version = latest.tag;
+                    result->downloadUrl = latest.assetUrl;
+                }
+            }
+        }
+        catch (const winrt::hresult_error& exception)
+        {
+            result->error = L"Update check failed: ";
+            result->error += exception.message().c_str();
+        }
+        catch (const std::exception& exception)
+        {
+            result->error = L"Update check failed: ";
+            const std::string message = exception.what();
+            result->error += std::wstring(message.begin(), message.end());
+        }
+
+        UpdateCheckResult* rawResult = result.release();
+        if (!PostMessageW(
+                mainWindow,
+                kUpdateCheckMessage,
+                0,
+                reinterpret_cast<LPARAM>(rawResult)))
+        {
+            // The window may have been closed while the request was running.
+            // In that case there is no UI owner left for the result.
+            delete rawResult;
+        }
+    }).detach();
+}
+
+void StartUpdateDownload(
+    const std::wstring& version,
+    const std::wstring& downloadUrl)
+{
+    if (g_app == nullptr || g_app->updateDownloadInProgress.exchange(true))
+    {
+        return;
+    }
+
+    const HWND mainWindow = g_app->mainWindow;
+    std::thread([mainWindow, version, downloadUrl]()
+    {
+        auto result = std::make_unique<UpdateDownloadResult>();
+        result->version = version;
+        const auto tempPath = CreateUpdateTempPath();
+        if (!tempPath.has_value())
+        {
+            result->error = L"Could not create a temporary update path.";
+        }
+        else
+        {
+            result->tempPath = *tempPath;
+            result->succeeded = DownloadUpdate(
+                downloadUrl,
+                result->tempPath,
+                result->error);
+        }
+
+        UpdateDownloadResult* rawResult = result.release();
+        if (!PostMessageW(
+                mainWindow,
+                kUpdateDownloadMessage,
+                0,
+                reinterpret_cast<LPARAM>(rawResult)))
+        {
+            // The window may have been closed while the download was running.
+            if (!rawResult->tempPath.empty())
+            {
+                DeleteFileW(rawResult->tempPath.c_str());
+            }
+            delete rawResult;
+        }
+    }).detach();
+}
+
+std::wstring QuoteCommandLineArgument(const std::wstring& value)
+{
+    return L"\"" + value + L"\"";
+}
+
+std::optional<std::wstring> CurrentExecutablePath()
+{
+    std::vector<wchar_t> buffer(MAX_PATH);
+    for (;;)
+    {
+        const DWORD length = GetModuleFileNameW(
+            nullptr,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()));
+        if (length == 0)
+        {
+            return std::nullopt;
+        }
+        if (length < buffer.size() - 1)
+        {
+            return std::wstring(buffer.data(), length);
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+}
+
+bool LaunchPendingUpdate(const std::wstring& tempPath)
+{
+    const auto executablePath = CurrentExecutablePath();
+    if (!executablePath.has_value())
+    {
+        return false;
+    }
+
+    const size_t separator = executablePath->find_last_of(L"\\/");
+    if (separator == std::wstring::npos)
+    {
+        return false;
+    }
+    const std::wstring directory = executablePath->substr(0, separator);
+    const std::wstring updaterPath = directory + L"\\ArtyBuddyUpdater.exe";
+    if (GetFileAttributesW(updaterPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        return false;
+    }
+
+    std::wstring commandLine =
+        QuoteCommandLineArgument(updaterPath) +
+        L" --apply-update " +
+        QuoteCommandLineArgument(tempPath) +
+        L" " +
+        QuoteCommandLineArgument(*executablePath) +
+        L" " +
+        std::to_wstring(GetCurrentProcessId());
+    std::vector<wchar_t> mutableCommandLine(
+        commandLine.begin(),
+        commandLine.end());
+    mutableCommandLine.push_back(L'\0');
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESHOWWINDOW;
+    startup.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(
+            updaterPath.c_str(),
+            mutableCommandLine.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            CREATE_NO_WINDOW,
+            nullptr,
+            directory.c_str(),
+            &startup,
+            &process))
+    {
+        return false;
+    }
+
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+void HandleUpdateCheckResult(UpdateCheckResult* result)
+{
+    std::unique_ptr<UpdateCheckResult> ownedResult(result);
+    if (g_app == nullptr || result == nullptr)
+    {
+        return;
+    }
+
+    g_app->updateCheckInProgress = false;
+    if (!result->updateAvailable || !g_app->autoUpdateEnabled)
+    {
+        return;
+    }
+
+    const std::wstring message =
+        L"Arty Buddy " + result->version +
+        L" is available. Download and install it now?";
+    if (MessageBoxW(
+            g_app->mainWindow,
+            message.c_str(),
+            L"Arty Buddy update",
+            MB_YESNO | MB_ICONINFORMATION) == IDYES)
+    {
+        SetStatus(L"Downloading the Arty Buddy update...");
+        StartUpdateDownload(result->version, result->downloadUrl);
+    }
+}
+
+void HandleUpdateDownloadResult(UpdateDownloadResult* result)
+{
+    std::unique_ptr<UpdateDownloadResult> ownedResult(result);
+    if (g_app == nullptr || result == nullptr)
+    {
+        return;
+    }
+
+    g_app->updateDownloadInProgress = false;
+    if (!result->succeeded)
+    {
+        if (!result->tempPath.empty())
+        {
+            DeleteFileW(result->tempPath.c_str());
+        }
+        const std::wstring message = result->error.empty()
+            ? L"The Arty Buddy update could not be downloaded."
+            : result->error;
+        SetStatus(message);
+        MessageBoxW(
+            g_app->mainWindow,
+            message.c_str(),
+            L"Arty Buddy update",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    if (!LaunchPendingUpdate(result->tempPath))
+    {
+        DeleteFileW(result->tempPath.c_str());
+        const wchar_t message[] =
+            L"The Arty Buddy update could not be started.";
+        SetStatus(message);
+        MessageBoxW(
+            g_app->mainWindow,
+            message,
+            L"Arty Buddy update",
+            MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    g_app->closing = true;
+    DestroyWindow(g_app->mainWindow);
+}
+
 void ApplyOverlayHitTesting()
 {
     if (g_app == nullptr || g_app->overlayWindow == nullptr)
@@ -2274,6 +3082,27 @@ void ToggleClickThrough()
         g_app->clickThrough ? L"Overlay is now click-through."
                             : L"Overlay now accepts mouse input.");
     UpdateDisplay();
+}
+
+void ToggleAutoUpdate()
+{
+    if (g_app == nullptr)
+    {
+        return;
+    }
+
+    g_app->autoUpdateEnabled = !g_app->autoUpdateEnabled;
+    SaveHotkeyBindings(*g_app);
+    SetStatus(
+        g_app->autoUpdateEnabled
+            ? L"Automatic update checks enabled."
+            : L"Automatic update checks disabled.");
+    UpdateDisplay();
+
+    if (g_app->autoUpdateEnabled)
+    {
+        StartUpdateCheck();
+    }
 }
 
 void ShowMainWindow()
@@ -2589,6 +3418,7 @@ void ShowSettingsPage(bool show)
 
     ShowWindow(g_app->settingsButton, show ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app->settingsBackButton, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app->autoUpdateButton, show ? SW_SHOW : SW_HIDE);
     for (const HWND control : g_app->hotkeyControls)
     {
         ShowWindow(control, show ? SW_SHOW : SW_HIDE);
@@ -2718,6 +3548,13 @@ void CreateMainControls(HWND window)
             178,
             32);
     }
+    g_app->autoUpdateButton = button(
+        kCommandToggleAutoUpdate,
+        L"Auto-update",
+        190,
+        316,
+        178,
+        32);
 
     UpdateCoordinateInputControls();
 
@@ -2731,8 +3568,11 @@ void PaintSettings(HDC dc)
 {
     UiText(dc, L"Settings", {82, 12, 330, 43}, 21, kText, FW_SEMIBOLD);
     UiText(dc, L"Keyboard shortcuts", {18, 55, 368, 76}, 11, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"Automatic updates", {18, 316, 180, 348}, 12, kText);
     UiText(dc, L"Click a shortcut, then press the key combination to assign it.",
-        {18, 350, 382, 374}, 11, kMuted);
+        {18, 362, 382, 386}, 11, kMuted);
+    UiText(dc, L"Checks GitHub for a newer stable release when the app starts.",
+        {18, 388, 382, 412}, 11, kMuted);
     for (size_t index = 0; index < kHotkeyCount; ++index)
     {
         const int top = 76 + static_cast<int>(index) * 48;
@@ -3080,6 +3920,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         const bool settingsControl =
             item->CtlID == kCommandSettings ||
             item->CtlID == kCommandSettingsBack ||
+            item->CtlID == kCommandToggleAutoUpdate ||
             (item->CtlID >= kCommandHotkeyBase &&
              item->CtlID < kCommandHotkeyBase + static_cast<int>(kHotkeyCount));
         bool down = (item->itemState & ODS_SELECTED) != 0;
@@ -3095,6 +3936,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         std::wstring text = label;
         if (item->CtlID == kCommandToggleOverlay) text += g_app->overlayEnabled ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleClickThrough) text += g_app->clickThrough ? L"  ON" : L"  OFF";
+        if (item->CtlID == kCommandToggleAutoUpdate) text += g_app->autoUpdateEnabled ? L"  ON" : L"  OFF";
         const int textSize = item->CtlID == kCommandSettings ? 20 : 12;
         UiText(item->hDC, text, item->rcItem, textSize, primary ? kBackground : kText,
             primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3121,6 +3963,12 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         break;
     case kOcrResultMessage:
         HandleOcrResult(reinterpret_cast<OcrResult*>(lParam));
+        return 0;
+    case kUpdateCheckMessage:
+        HandleUpdateCheckResult(reinterpret_cast<UpdateCheckResult*>(lParam));
+        return 0;
+    case kUpdateDownloadMessage:
+        HandleUpdateDownloadResult(reinterpret_cast<UpdateDownloadResult*>(lParam));
         return 0;
 
     case WM_CREATE:
@@ -3172,6 +4020,9 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return 0;
         case kCommandToggleClickThrough:
             ToggleClickThrough();
+            return 0;
+        case kCommandToggleAutoUpdate:
+            ToggleAutoUpdate();
             return 0;
         case kCommandExit:
             if (g_app != nullptr)
@@ -3442,6 +4293,7 @@ int APIENTRY wWinMain(
     UpdateDisplay();
     ShowWindow(state.mainWindow, SW_SHOWNORMAL);
     UpdateWindow(state.mainWindow);
+    StartUpdateCheck();
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0)
