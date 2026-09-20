@@ -48,7 +48,9 @@ The horizontal traverse ladder is handled the same way, using the circular refer
 
 The default shortcuts are `Ctrl+Alt+1`, `Ctrl+Alt+2`, `Ctrl+Alt+O`, `Ctrl+Alt+T`, and `Ctrl+Alt+C`. Open the settings page with the cog button to assign any shortcut, including Ctrl, Alt, Shift, and Win modifiers. Click a shortcut button, then press the desired key combination.
 
-The settings page also includes automatic updates, enabled by default. When enabled, Arty Buddy checks the latest stable GitHub release at startup and asks whether to download and install a newer Windows executable. The updater downloads over HTTPS, uses the bundled `ArtyBuddyUpdater.exe` helper to replace the executable after Arty Buddy exits, and restarts the app.
+The settings page also includes automatic updates, enabled by default. When enabled, Arty Buddy checks the latest stable GitHub release at startup and asks whether to download and install a newer Windows executable. The updater downloads over HTTPS, uses the bundled `ArtyBuddyUpdater.exe` helper to replace the executable after Arty Buddy exits, and restarts the app. The **Exit on close** setting is off by default; when enabled, closing the main Arty Buddy window exits the process instead of leaving it in the tray.
+
+Right-click the tray icon for the context menu. It includes an explicit **Exit** command; double-clicking the icon reopens the main window.
 
 The application uses a normal topmost layered window that tracks the main window of `WardogsClient-Win64-Shipping.exe`. It is enabled by default and stays click-through unless toggled. It is shown only while Wardogs is the foreground, non-minimized window; it hides when the game is not running, minimized, or another window is active. It can also be disabled with `Ctrl+Alt+O`. It does not inject into DirectX or into the game process. Borderless-windowed games are generally the most reliable target for this kind of overlay; exclusive fullscreen and anti-cheat software may still hide or block any external window.
 

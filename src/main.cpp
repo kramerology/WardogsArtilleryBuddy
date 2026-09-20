@@ -86,6 +86,7 @@ constexpr int kCommandApplyTarget = 1010;
 constexpr int kCommandPastePlayer = 1011;
 constexpr int kCommandPasteTarget = 1012;
 constexpr int kCommandToggleAutoUpdate = 1013;
+constexpr int kCommandToggleExitOnClose = 1014;
 constexpr int kCommandHotkeyBase = 1100;
 constexpr int kControlPlayerX = 1201;
 constexpr int kControlPlayerY = 1202;
@@ -95,6 +96,7 @@ constexpr size_t kHotkeyCount = 5;
 
 constexpr wchar_t kSettingsRegistryPath[] = L"Software\\ArtyBuddy";
 constexpr wchar_t kAutoUpdateRegistryName[] = L"AutoUpdateEnabled";
+constexpr wchar_t kExitOnCloseRegistryName[] = L"ExitOnMainWindowClose";
 constexpr const wchar_t* kHotkeyRegistryNames[] = {
     L"CapturePlayerModifiers",
     L"CapturePlayerKey",
@@ -237,6 +239,7 @@ struct AppState
     bool overlayVisible{false};
     bool clickThrough{true};
     bool autoUpdateEnabled{true};
+    bool exitOnMainWindowClose{false};
     bool closing{false};
     bool settingsVisible{false};
     bool hotkeysRegistered{false};
@@ -255,6 +258,7 @@ struct AppState
     HWND pastePlayerButton{};
     HWND pasteTargetButton{};
     HWND autoUpdateButton{};
+    HWND exitOnCloseButton{};
     std::atomic_bool updateCheckInProgress{false};
     std::atomic_bool updateDownloadInProgress{false};
     std::atomic_bool ocrInProgress{false};
@@ -286,6 +290,7 @@ void LoadHotkeyBindings(AppState& state)
 {
     state.hotkeys = DefaultHotkeyBindings();
     state.autoUpdateEnabled = true;
+    state.exitOnMainWindowClose = false;
 
     HKEY key = nullptr;
     if (RegOpenKeyExW(
@@ -346,6 +351,20 @@ void LoadHotkeyBindings(AppState& state)
         state.autoUpdateEnabled = autoUpdateEnabled != 0;
     }
 
+    DWORD exitOnMainWindowClose = 0;
+    DWORD exitOnMainWindowCloseSize = sizeof(exitOnMainWindowClose);
+    if (RegGetValueW(
+            key,
+            nullptr,
+            kExitOnCloseRegistryName,
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &exitOnMainWindowClose,
+            &exitOnMainWindowCloseSize) == ERROR_SUCCESS)
+    {
+        state.exitOnMainWindowClose = exitOnMainWindowClose != 0;
+    }
+
     RegCloseKey(key);
 }
 
@@ -395,6 +414,15 @@ void SaveHotkeyBindings(const AppState& state)
         REG_DWORD,
         reinterpret_cast<const BYTE*>(&autoUpdateEnabled),
         sizeof(autoUpdateEnabled));
+
+    const DWORD exitOnMainWindowClose = state.exitOnMainWindowClose ? 1u : 0u;
+    RegSetValueExW(
+        key,
+        kExitOnCloseRegistryName,
+        0,
+        REG_DWORD,
+        reinterpret_cast<const BYTE*>(&exitOnMainWindowClose),
+        sizeof(exitOnMainWindowClose));
 
     RegCloseKey(key);
 }
@@ -3105,6 +3133,22 @@ void ToggleAutoUpdate()
     }
 }
 
+void ToggleExitOnMainWindowClose()
+{
+    if (g_app == nullptr)
+    {
+        return;
+    }
+
+    g_app->exitOnMainWindowClose = !g_app->exitOnMainWindowClose;
+    SaveHotkeyBindings(*g_app);
+    SetStatus(
+        g_app->exitOnMainWindowClose
+            ? L"Closing the main window will exit Arty Buddy."
+            : L"Closing the main window will keep Arty Buddy in the tray.");
+    UpdateDisplay();
+}
+
 void ShowMainWindow()
 {
     if (g_app == nullptr || g_app->mainWindow == nullptr)
@@ -3419,6 +3463,7 @@ void ShowSettingsPage(bool show)
     ShowWindow(g_app->settingsButton, show ? SW_HIDE : SW_SHOW);
     ShowWindow(g_app->settingsBackButton, show ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app->autoUpdateButton, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app->exitOnCloseButton, show ? SW_SHOW : SW_HIDE);
     for (const HWND control : g_app->hotkeyControls)
     {
         ShowWindow(control, show ? SW_SHOW : SW_HIDE);
@@ -3555,6 +3600,13 @@ void CreateMainControls(HWND window)
         316,
         178,
         32);
+    g_app->exitOnCloseButton = button(
+        kCommandToggleExitOnClose,
+        L"Exit on close",
+        190,
+        364,
+        178,
+        32);
 
     UpdateCoordinateInputControls();
 
@@ -3569,10 +3621,13 @@ void PaintSettings(HDC dc)
     UiText(dc, L"Settings", {82, 12, 330, 43}, 21, kText, FW_SEMIBOLD);
     UiText(dc, L"Keyboard shortcuts", {18, 55, 368, 76}, 11, kMuted, FW_SEMIBOLD);
     UiText(dc, L"Automatic updates", {18, 316, 180, 348}, 12, kText);
+    UiText(dc, L"Exit when window closes", {18, 364, 180, 396}, 12, kText);
     UiText(dc, L"Click a shortcut, then press the key combination to assign it.",
-        {18, 362, 382, 386}, 11, kMuted);
-    UiText(dc, L"Checks GitHub for a newer stable release when the app starts.",
-        {18, 388, 382, 412}, 11, kMuted);
+        {18, 412, 382, 436}, 11, kMuted);
+    UiText(dc, L"Automatic updates check GitHub for a newer stable release at startup.",
+        {18, 438, 382, 462}, 11, kMuted);
+    UiText(dc, L"When exit-on-close is off, closing this window keeps Arty Buddy in the tray.",
+        {18, 464, 382, 488}, 11, kMuted);
     for (size_t index = 0; index < kHotkeyCount; ++index)
     {
         const int top = 76 + static_cast<int>(index) * 48;
@@ -3921,6 +3976,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             item->CtlID == kCommandSettings ||
             item->CtlID == kCommandSettingsBack ||
             item->CtlID == kCommandToggleAutoUpdate ||
+            item->CtlID == kCommandToggleExitOnClose ||
             (item->CtlID >= kCommandHotkeyBase &&
              item->CtlID < kCommandHotkeyBase + static_cast<int>(kHotkeyCount));
         bool down = (item->itemState & ODS_SELECTED) != 0;
@@ -3937,6 +3993,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         if (item->CtlID == kCommandToggleOverlay) text += g_app->overlayEnabled ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleClickThrough) text += g_app->clickThrough ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleAutoUpdate) text += g_app->autoUpdateEnabled ? L"  ON" : L"  OFF";
+        if (item->CtlID == kCommandToggleExitOnClose) text += g_app->exitOnMainWindowClose ? L"  ON" : L"  OFF";
         const int textSize = item->CtlID == kCommandSettings ? 20 : 12;
         UiText(item->hDC, text, item->rcItem, textSize, primary ? kBackground : kText,
             primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -4024,6 +4081,9 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         case kCommandToggleAutoUpdate:
             ToggleAutoUpdate();
             return 0;
+        case kCommandToggleExitOnClose:
+            ToggleExitOnMainWindowClose();
+            return 0;
         case kCommandExit:
             if (g_app != nullptr)
             {
@@ -4068,18 +4128,28 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         break;
 
     case kTrayMessage:
-        if (lParam == WM_LBUTTONDBLCLK)
+    {
+        const UINT trayEvent = static_cast<UINT>(lParam);
+        const UINT lowTrayEvent = LOWORD(lParam);
+        const UINT highTrayEvent = HIWORD(lParam);
+        const auto isTrayEvent = [&](UINT expected) {
+            return trayEvent == expected || lowTrayEvent == expected ||
+                highTrayEvent == expected;
+        };
+
+        if (isTrayEvent(WM_LBUTTONDBLCLK))
         {
             ShowMainWindow();
             return 0;
         }
 
-        if (lParam == WM_RBUTTONUP)
+        if (isTrayEvent(WM_RBUTTONUP) || isTrayEvent(WM_CONTEXTMENU))
         {
             ShowTrayMenu(window);
             return 0;
         }
         break;
+    }
 
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED)
@@ -4097,13 +4167,18 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         break;
 
     case WM_CLOSE:
-        if (g_app != nullptr && !g_app->closing)
+        if (g_app != nullptr && !g_app->closing && !g_app->exitOnMainWindowClose)
         {
             ShowWindow(window, SW_HIDE);
             SetStatus(L"Running in the system tray. Double-click the tray icon to reopen.");
             return 0;
         }
-        break;
+        if (g_app != nullptr)
+        {
+            g_app->closing = true;
+        }
+        DestroyWindow(window);
+        return 0;
 
     case WM_DESTROY:
         KillTimer(window, kGamePollTimer);
