@@ -59,7 +59,7 @@ constexpr UINT kGamePollIntervalMs = 250;
 constexpr UINT kUpdateCheckMessage = WM_APP + 3;
 constexpr UINT kUpdateDownloadMessage = WM_APP + 4;
 constexpr wchar_t kTargetProcessName[] = L"WardogsClient-Win64-Shipping.exe";
-constexpr wchar_t kCurrentVersion[] = L"0.0.3";
+constexpr wchar_t kCurrentVersion[] = L"0.0.4";
 constexpr wchar_t kLatestReleaseApiUrl[] =
     L"https://api.github.com/repos/kramerology/WardogsArtilleryBuddy/releases/latest";
 
