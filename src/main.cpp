@@ -18,9 +18,6 @@
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.Graphics.Imaging.h>
-#include <winrt/Windows.Media.Ocr.h>
-#include <winrt/Windows.Storage.Streams.h>
 
 #include <atomic>
 #include <algorithm>
@@ -59,7 +56,6 @@ constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kTrayId = 1;
 constexpr UINT_PTR kGamePollTimer = 1;
 constexpr UINT kGamePollIntervalMs = 250;
-constexpr UINT kOcrResultMessage = WM_APP + 2;
 constexpr UINT kUpdateCheckMessage = WM_APP + 3;
 constexpr UINT kUpdateDownloadMessage = WM_APP + 4;
 constexpr wchar_t kTargetProcessName[] = L"WardogsClient-Win64-Shipping.exe";
@@ -110,8 +106,17 @@ constexpr const wchar_t* kHotkeyRegistryNames[] = {
     L"ToggleClickThroughKey",
 };
 
-constexpr double kOcrScale = 2.0;
 constexpr double kDefaultMetersPerCoordinateUnit = 100.0;
+constexpr double kMaximumRangeMeters = 700.0;
+constexpr LONG kCoordinateMacroMouseOffset = 10;
+constexpr DWORD kCoordinateMacroStepDelayMs = 40;
+constexpr DWORD kCoordinateMacroClickSettleDelayMs = 300;
+constexpr int kCoordinateMacroSelectAllAttempts = 3;
+constexpr DWORD kCoordinateMacroClipboardTimeoutMs = 1000;
+constexpr int kCoordinateMacroMaxAttempts = 2;
+constexpr DWORD kCoordinateMacroRetryStepDelayMs = 100;
+constexpr DWORD kCoordinateMacroRetryClickSettleDelayMs = 700;
+constexpr DWORD kCoordinateMacroRetryClipboardTimeoutMs = 1500;
 
 // Fixed L81 mortar range marks, from the lowest to the highest reference
 // label. These are the values printed on the in-game ladder; they are not
@@ -172,45 +177,6 @@ struct HotkeyBinding
     UINT virtualKey{};
 };
 
-struct CapturedImage
-{
-    int width{};
-    int height{};
-    int stride{};
-    std::vector<std::uint8_t> pixels;
-};
-
-struct CapturedRegion
-{
-    CapturedImage image;
-    int cropLeft{};
-    int cropTop{};
-    int clientWidth{};
-    int clientHeight{};
-};
-
-struct OcrTextPass
-{
-    std::wstring text;
-    bool focused{};
-};
-
-struct OcrRecognition
-{
-    std::wstring combinedText;
-    std::vector<OcrTextPass> passes;
-};
-
-struct OcrResult
-{
-    bool firstPoint{};
-    bool coordinateFound{};
-    Coordinate coordinate{};
-    std::wstring recognizedText;
-    std::vector<OcrTextPass> ocrPasses;
-    std::wstring error;
-};
-
 struct AppState
 {
     HINSTANCE instance{};
@@ -261,7 +227,6 @@ struct AppState
     HWND exitOnCloseButton{};
     std::atomic_bool updateCheckInProgress{false};
     std::atomic_bool updateDownloadInProgress{false};
-    std::atomic_bool ocrInProgress{false};
 };
 
 AppState* g_app = nullptr;
@@ -506,6 +471,11 @@ std::wstring FormatCoordinate(const Coordinate& coordinate)
            FormatNumber(coordinate.y, 3);
 }
 
+std::wstring DisplayCoordinate(const std::optional<Coordinate>& coordinate)
+{
+    return FormatCoordinate(coordinate.value_or(Coordinate{}));
+}
+
 void SetCoordinateEditValue(HWND edit, const std::optional<double>& value)
 {
     if (edit == nullptr)
@@ -513,9 +483,7 @@ void SetCoordinateEditValue(HWND edit, const std::optional<double>& value)
         return;
     }
 
-    const std::wstring text = value.has_value()
-        ? FormatNumber(*value, 3)
-        : L"";
+    const std::wstring text = FormatNumber(value.value_or(0.0), 3);
     SetWindowTextW(edit, text.c_str());
 }
 
@@ -759,7 +727,7 @@ std::optional<std::wstring> GetClipboardText()
     return result;
 }
 
-struct OcrNumberToken
+struct CoordinateNumberToken
 {
     double value{};
     std::size_t position{};
@@ -767,36 +735,35 @@ struct OcrNumberToken
     int fractionalDigits{};
 };
 
-struct OcrLabeledValue
+struct CoordinateLabeledValue
 {
-    OcrNumberToken value;
+    CoordinateNumberToken value;
     std::size_t labelPosition{};
 };
 
-struct ParsedOcrCoordinate
+struct ParsedCoordinateText
 {
     Coordinate coordinate{};
     int quality{};
 };
 
-const std::wstring& OcrNumberPattern()
+const std::wstring& CoordinateNumberPattern()
 {
     static const std::wstring pattern =
         LR"([-+]?(?:\d+(?:\.\d*)?|\.\d+))";
     return pattern;
 }
 
-const std::wstring& OcrNumberLikePattern()
+const std::wstring& CoordinateNumberLikePattern()
 {
-    // Windows OCR commonly returns zeroes as 'o' and nines as 'g' when the
-    // coordinate text is over a textured map. Restrict these substitutions
-    // to values immediately following an x/y label.
+    // Accept common text-copy glyph variants while keeping substitutions
+    // restricted to values immediately following an x/y label.
     static const std::wstring pattern =
         LR"([-+]?(?:[0-9OoGgSsBbIiLl|]+(?:\.[0-9OoGgSsBbIiLl|]*)?|\.[0-9OoGgSsBbIiLl|]+))";
     return pattern;
 }
 
-std::optional<OcrNumberToken> ParseOcrNumberToken(
+std::optional<CoordinateNumberToken> ParseCoordinateNumberToken(
     const std::wstring& value,
     std::size_t position)
 {
@@ -847,7 +814,7 @@ std::optional<OcrNumberToken> ParseOcrNumberToken(
         const int fractionalDigits = decimal == std::wstring::npos
             ? 0
             : static_cast<int>(normalized.size() - decimal - 1);
-        return OcrNumberToken{
+        return CoordinateNumberToken{
             parsed,
             position,
             value.size(),
@@ -859,19 +826,19 @@ std::optional<OcrNumberToken> ParseOcrNumberToken(
     }
 }
 
-std::vector<OcrNumberToken> FindOcrNumberTokens(const std::wstring& text)
+std::vector<CoordinateNumberToken> FindCoordinateNumberTokens(const std::wstring& text)
 {
-    std::vector<OcrNumberToken> numbers;
+    std::vector<CoordinateNumberToken> numbers;
 
     try
     {
-        const std::wregex numberRegex(OcrNumberPattern());
+        const std::wregex numberRegex(CoordinateNumberPattern());
         for (std::wsregex_iterator iterator(text.begin(), text.end(), numberRegex);
              iterator != std::wsregex_iterator();
              ++iterator)
         {
             const auto match = *iterator;
-            const auto token = ParseOcrNumberToken(
+            const auto token = ParseCoordinateNumberToken(
                 match.str(),
                 static_cast<std::size_t>(match.position()));
             if (token.has_value())
@@ -882,17 +849,17 @@ std::vector<OcrNumberToken> FindOcrNumberTokens(const std::wstring& text)
     }
     catch (const std::exception&)
     {
-        // Invalid OCR text is handled as a parse failure below.
+        // Invalid coordinate text is handled as a parse failure below.
     }
 
     return numbers;
 }
 
-std::vector<OcrLabeledValue> FindOcrLabeledValues(
+std::vector<CoordinateLabeledValue> FindCoordinateLabeledValues(
     const std::wstring& text,
     wchar_t label)
 {
-    std::vector<OcrLabeledValue> values;
+    std::vector<CoordinateLabeledValue> values;
 
     try
     {
@@ -900,7 +867,7 @@ std::vector<OcrLabeledValue> FindOcrLabeledValues(
             ? L"[xX]"
             : L"[yY]";
         const std::wregex pattern(
-            labelPattern + L"\\s*[:=]?\\s*(" + OcrNumberLikePattern() + L")");
+            labelPattern + L"\\s*[:=]?\\s*(" + CoordinateNumberLikePattern() + L")");
 
         for (std::wsregex_iterator iterator(text.begin(), text.end(), pattern);
              iterator != std::wsregex_iterator();
@@ -912,12 +879,12 @@ std::vector<OcrLabeledValue> FindOcrLabeledValues(
                 continue;
             }
 
-            const auto token = ParseOcrNumberToken(
+            const auto token = ParseCoordinateNumberToken(
                 match.str(1),
                 static_cast<std::size_t>(match.position(1)));
             if (token.has_value())
             {
-                values.push_back(OcrLabeledValue{
+                values.push_back(CoordinateLabeledValue{
                     *token,
                     static_cast<std::size_t>(match.position())});
             }
@@ -925,13 +892,13 @@ std::vector<OcrLabeledValue> FindOcrLabeledValues(
     }
     catch (const std::exception&)
     {
-        // Invalid OCR text is handled as a parse failure below.
+        // Invalid coordinate text is handled as a parse failure below.
     }
 
     return values;
 }
 
-int OcrPrecisionQuality(const OcrNumberToken& token)
+int CoordinatePrecisionQuality(const CoordinateNumberToken& token)
 {
     // The game prints two fractional digits. Prefer that stable format over
     // a noisy pass that invents or drops a decimal digit.
@@ -950,12 +917,12 @@ int OcrPrecisionQuality(const OcrNumberToken& token)
     return 0;
 }
 
-const OcrNumberToken* FindNearestDecimalToken(
-    const std::vector<OcrNumberToken>& numbers,
+const CoordinateNumberToken* FindNearestDecimalToken(
+    const std::vector<CoordinateNumberToken>& numbers,
     std::size_t anchor,
     bool preferBefore)
 {
-    const OcrNumberToken* nearest = nullptr;
+    const CoordinateNumberToken* nearest = nullptr;
     long long nearestScore = std::numeric_limits<long long>::max();
 
     for (const auto& number : numbers)
@@ -986,17 +953,17 @@ const OcrNumberToken* FindNearestDecimalToken(
     return nearest;
 }
 
-std::optional<ParsedOcrCoordinate> ParseSingleOcrCoordinate(
+std::optional<ParsedCoordinateText> ParseSingleCoordinateText(
     const std::wstring& text)
 {
-    const auto numbers = FindOcrNumberTokens(text);
-    const auto xValues = FindOcrLabeledValues(text, L'x');
-    const auto yValues = FindOcrLabeledValues(text, L'y');
+    const auto numbers = FindCoordinateNumberTokens(text);
+    const auto xValues = FindCoordinateLabeledValues(text, L'x');
+    const auto yValues = FindCoordinateLabeledValues(text, L'y');
 
     if (!xValues.empty() && !yValues.empty())
     {
-        const OcrLabeledValue* bestX = nullptr;
-        const OcrLabeledValue* bestY = nullptr;
+        const CoordinateLabeledValue* bestX = nullptr;
+        const CoordinateLabeledValue* bestY = nullptr;
         long long bestDistance = std::numeric_limits<long long>::max();
 
         for (const auto& x : xValues)
@@ -1017,26 +984,25 @@ std::optional<ParsedOcrCoordinate> ParseSingleOcrCoordinate(
 
         if (bestX != nullptr && bestY != nullptr)
         {
-            return ParsedOcrCoordinate{
+            return ParsedCoordinateText{
                 Coordinate{bestX->value.value, bestY->value.value},
-                60 + OcrPrecisionQuality(bestX->value) +
-                    OcrPrecisionQuality(bestY->value)};
+                60 + CoordinatePrecisionQuality(bestX->value) +
+                    CoordinatePrecisionQuality(bestY->value)};
         }
     }
 
-    // Windows OCR sometimes drops the small 'y' glyph, while retaining the
-    // decimal number. In the map UI the y label is immediately above the x
-    // label, so associate the nearest decimal token with a surviving x label.
+    // If one axis label is missing, associate the nearest decimal token with
+    // the surviving axis label.
     if (!xValues.empty())
     {
         const auto& x = xValues.front();
         const auto* y = FindNearestDecimalToken(numbers, x.value.position, true);
         if (y != nullptr)
         {
-            return ParsedOcrCoordinate{
+            return ParsedCoordinateText{
                 Coordinate{x.value.value, y->value},
-                35 + OcrPrecisionQuality(x.value) +
-                    OcrPrecisionQuality(*y)};
+                35 + CoordinatePrecisionQuality(x.value) +
+                    CoordinatePrecisionQuality(*y)};
         }
     }
 
@@ -1048,17 +1014,17 @@ std::optional<ParsedOcrCoordinate> ParseSingleOcrCoordinate(
         const auto* x = FindNearestDecimalToken(numbers, y.value.position, false);
         if (x != nullptr)
         {
-            return ParsedOcrCoordinate{
+            return ParsedCoordinateText{
                 Coordinate{x->value, y.value.value},
-                35 + OcrPrecisionQuality(*x) +
-                    OcrPrecisionQuality(y.value)};
+                35 + CoordinatePrecisionQuality(*x) +
+                    CoordinatePrecisionQuality(y.value)};
         }
     }
 
-    // Keep support for a clean, unlabeled "x, y" OCR result. This fallback
+    // Keep support for a clean, unlabeled "x, y" coordinate result. This fallback
     // is deliberately only used when there are exactly two decimal values,
     // so axis/range integers in the broad capture cannot become coordinates.
-    std::vector<const OcrNumberToken*> decimalNumbers;
+    std::vector<const CoordinateNumberToken*> decimalNumbers;
     for (const auto& number : numbers)
     {
         if (number.fractionalDigits > 0)
@@ -1068,82 +1034,41 @@ std::optional<ParsedOcrCoordinate> ParseSingleOcrCoordinate(
     }
     if (decimalNumbers.size() == 2)
     {
-        return ParsedOcrCoordinate{
+        return ParsedCoordinateText{
             Coordinate{decimalNumbers[0]->value, decimalNumbers[1]->value},
-            20 + OcrPrecisionQuality(*decimalNumbers[0]) +
-                OcrPrecisionQuality(*decimalNumbers[1])};
+            20 + CoordinatePrecisionQuality(*decimalNumbers[0]) +
+                CoordinatePrecisionQuality(*decimalNumbers[1])};
     }
 
     return std::nullopt;
 }
 
-std::optional<Coordinate> ParseOcrCoordinate(const std::wstring& text)
+std::optional<Coordinate> ParseCoordinateText(const std::wstring& text)
 {
-    const auto parsed = ParseSingleOcrCoordinate(text);
+    const auto parsed = ParseSingleCoordinateText(text);
     return parsed.has_value()
         ? std::optional<Coordinate>(parsed->coordinate)
         : std::nullopt;
 }
 
-std::optional<Coordinate> SelectOcrCoordinate(
-    const std::vector<OcrTextPass>& passes)
+struct WinrtApartmentGuard
 {
-    std::vector<ParsedOcrCoordinate> candidates;
-    candidates.reserve(passes.size());
+    bool initialized{false};
 
-    for (const auto& pass : passes)
+    WinrtApartmentGuard()
     {
-        const auto parsed = ParseSingleOcrCoordinate(pass.text);
-        if (!parsed.has_value())
-        {
-            continue;
-        }
-
-        ParsedOcrCoordinate candidate = *parsed;
-        if (pass.focused)
-        {
-            // A focused map-label pass has fewer axis and HUD numbers to
-            // confuse the parser, so let it win when OCR quality is close.
-            candidate.quality += 12;
-        }
-        candidates.push_back(candidate);
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        initialized = true;
     }
 
-    if (candidates.empty())
+    ~WinrtApartmentGuard()
     {
-        return std::nullopt;
-    }
-
-    std::size_t bestIndex = 0;
-    int bestScore = std::numeric_limits<int>::min();
-    for (std::size_t index = 0; index < candidates.size(); ++index)
-    {
-        int score = candidates[index].quality;
-        for (std::size_t other = 0; other < candidates.size(); ++other)
+        if (initialized)
         {
-            if (index == other)
-            {
-                continue;
-            }
-
-            if (std::abs(candidates[index].coordinate.x -
-                         candidates[other].coordinate.x) < 0.005 &&
-                std::abs(candidates[index].coordinate.y -
-                         candidates[other].coordinate.y) < 0.005)
-            {
-                score += 6;
-            }
-        }
-
-        if (score > bestScore)
-        {
-            bestIndex = index;
-            bestScore = score;
+            winrt::uninit_apartment();
         }
     }
-
-    return candidates[bestIndex].coordinate;
-}
+};
 
 void SetStatus(const std::wstring& message)
 {
@@ -1407,6 +1332,8 @@ bool IsTargetGameForeground(HWND targetWindow, DWORD targetProcessId)
            GetAncestor(foregroundWindow, GA_ROOTOWNER) == targetWindow;
 }
 
+void ClearCapturedCoordinates();
+
 void RefreshTargetGame()
 {
     if (g_app == nullptr || g_app->overlayWindow == nullptr)
@@ -1416,11 +1343,19 @@ void RefreshTargetGame()
 
     const DWORD processId = FindTargetProcessId();
     const HWND targetWindow = FindTargetMainWindow(processId);
+    const bool gameWasRunning = g_app->targetProcessId != 0;
 
     const bool oldVisible = g_app->overlayVisible;
     const HWND oldTargetWindow = g_app->targetWindow;
     g_app->targetProcessId = processId;
     g_app->targetWindow = targetWindow;
+
+    if (gameWasRunning && processId == 0)
+    {
+        ClearCapturedCoordinates();
+        SetStatus(L"Game client closed. Player and target positions cleared.");
+        UpdateDisplay();
+    }
 
     const bool targetIsForeground =
         IsTargetGameForeground(targetWindow, processId);
@@ -1499,468 +1434,59 @@ void RefreshTargetGame()
     }
 }
 
-std::optional<CapturedRegion> CaptureClientRegion(
-    HWND targetWindow,
-    double leftFraction,
-    double topFraction,
-    double rightFraction,
-    double bottomFraction,
-    std::wstring& error)
+void RecalculateSolution()
 {
-    if (g_app == nullptr || targetWindow == nullptr || !IsWindow(targetWindow))
+    if (g_app == nullptr || !g_app->first.has_value() ||
+        !g_app->second.has_value())
     {
-        error = L"The game window is not available.";
-        return std::nullopt;
-    }
-
-    DWORD foregroundProcessId = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &foregroundProcessId);
-    if (foregroundProcessId != g_app->targetProcessId)
-    {
-        error = L"Bring WardogsClient to the foreground before pressing the hotkey.";
-        return std::nullopt;
-    }
-
-    RECT clientRect{};
-    if (!GetClientRect(targetWindow, &clientRect))
-    {
-        error = L"Could not determine the game client area.";
-        return std::nullopt;
-    }
-
-    const int clientWidth = clientRect.right - clientRect.left;
-    const int clientHeight = clientRect.bottom - clientRect.top;
-    if (clientWidth <= 0 || clientHeight <= 0)
-    {
-        error = L"The game client area is empty.";
-        return std::nullopt;
-    }
-
-    // In the supplied game layout, the coordinate labels are inside the
-    // centered map panel. Keep the capture broad enough for window resizing,
-    // while excluding the top-left utility overlay and most HUD elements.
-    const int cropLeft = std::clamp(
-        static_cast<int>(std::lround(clientWidth * leftFraction)),
-        0,
-        clientWidth - 1);
-    const int cropTop = std::clamp(
-        static_cast<int>(std::lround(clientHeight * topFraction)),
-        0,
-        clientHeight - 1);
-    const int cropRight = std::clamp(
-        static_cast<int>(std::lround(clientWidth * rightFraction)),
-        cropLeft + 1,
-        clientWidth);
-    const int cropBottom = std::clamp(
-        static_cast<int>(std::lround(clientHeight * bottomFraction)),
-        cropTop + 1,
-        clientHeight);
-    const int captureWidth = cropRight - cropLeft;
-    const int captureHeight = cropBottom - cropTop;
-
-    POINT screenOrigin{0, 0};
-    if (!ClientToScreen(targetWindow, &screenOrigin))
-    {
-        error = L"Could not locate the game on the screen.";
-        return std::nullopt;
-    }
-
-    HDC screenDc = GetDC(nullptr);
-    HDC memoryDc = screenDc != nullptr ? CreateCompatibleDC(screenDc) : nullptr;
-    HBITMAP bitmap = screenDc != nullptr
-        ? CreateCompatibleBitmap(screenDc, captureWidth, captureHeight)
-        : nullptr;
-    if (screenDc == nullptr || memoryDc == nullptr || bitmap == nullptr)
-    {
-        if (bitmap != nullptr)
+        if (g_app != nullptr)
         {
-            DeleteObject(bitmap);
+            g_app->distance.reset();
+            g_app->bearing.reset();
+            g_app->compassDirection.clear();
         }
-        if (memoryDc != nullptr)
-        {
-            DeleteDC(memoryDc);
-        }
-        if (screenDc != nullptr)
-        {
-            ReleaseDC(nullptr, screenDc);
-        }
-        error = L"Could not allocate a screen capture buffer.";
-        return std::nullopt;
+        return;
     }
 
-    HGDIOBJ previousBitmap = SelectObject(memoryDc, bitmap);
-    const BOOL copied = BitBlt(
-        memoryDc,
-        0,
-        0,
-        captureWidth,
-        captureHeight,
-        screenDc,
-        screenOrigin.x + cropLeft,
-        screenOrigin.y + cropTop,
-        SRCCOPY | CAPTUREBLT);
-    SelectObject(memoryDc, previousBitmap);
-
-    CapturedImage image;
-    image.width = captureWidth;
-    image.height = captureHeight;
-    image.stride = captureWidth * 4;
-    image.pixels.resize(static_cast<size_t>(image.stride) * image.height);
-
-    BITMAPINFO bitmapInfo{};
-    bitmapInfo.bmiHeader.biSize = sizeof(bitmapInfo.bmiHeader);
-    bitmapInfo.bmiHeader.biWidth = captureWidth;
-    bitmapInfo.bmiHeader.biHeight = -captureHeight;
-    bitmapInfo.bmiHeader.biPlanes = 1;
-    bitmapInfo.bmiHeader.biBitCount = 32;
-    bitmapInfo.bmiHeader.biCompression = BI_RGB;
-
-    const int scanLines = copied
-        ? GetDIBits(
-              screenDc,
-              bitmap,
-              0,
-              static_cast<UINT>(captureHeight),
-              image.pixels.data(),
-              &bitmapInfo,
-              DIB_RGB_COLORS)
-        : 0;
-
-    DeleteObject(bitmap);
-    DeleteDC(memoryDc);
-    ReleaseDC(nullptr, screenDc);
-
-    if (!copied || scanLines == 0)
-    {
-        error = L"Could not capture the game window.";
-        return std::nullopt;
-    }
-
-    CapturedRegion region;
-    region.image = std::move(image);
-    region.cropLeft = cropLeft;
-    region.cropTop = cropTop;
-    region.clientWidth = clientWidth;
-    region.clientHeight = clientHeight;
-    return region;
+    const double dx = g_app->second->x - g_app->first->x;
+    const double dy = g_app->second->y - g_app->first->y;
+    g_app->distance = std::hypot(dx, dy);
+    const DirectionResult direction = CalculateDirection(*g_app->first, *g_app->second);
+    g_app->bearing = direction.bearing;
+    g_app->compassDirection = direction.compass;
 }
 
-CapturedImage CropCapturedImage(
-    const CapturedImage& source,
-    double leftFraction,
-    double topFraction,
-    double rightFraction,
-    double bottomFraction)
+void ClearCapturedCoordinates()
 {
-    const int left = std::clamp(
-        static_cast<int>(std::lround(source.width * leftFraction)),
-        0,
-        std::max(0, source.width - 1));
-    const int top = std::clamp(
-        static_cast<int>(std::lround(source.height * topFraction)),
-        0,
-        std::max(0, source.height - 1));
-    const int right = std::clamp(
-        static_cast<int>(std::lround(source.width * rightFraction)),
-        left + 1,
-        source.width);
-    const int bottom = std::clamp(
-        static_cast<int>(std::lround(source.height * bottomFraction)),
-        top + 1,
-        source.height);
-
-    CapturedImage cropped;
-    cropped.width = right - left;
-    cropped.height = bottom - top;
-    cropped.stride = cropped.width * 4;
-    cropped.pixels.resize(static_cast<size_t>(cropped.stride) * cropped.height);
-
-    for (int y = 0; y < cropped.height; ++y)
+    if (g_app == nullptr)
     {
-        const auto* sourceRow = source.pixels.data() +
-            (static_cast<size_t>(top + y) * source.stride) +
-            (static_cast<size_t>(left) * 4);
-        auto* destinationRow = cropped.pixels.data() +
-            (static_cast<size_t>(y) * cropped.stride);
-        std::memcpy(destinationRow, sourceRow, static_cast<size_t>(cropped.stride));
+        return;
     }
 
-    return cropped;
+    g_app->first.reset();
+    g_app->second.reset();
+    RecalculateSolution();
+    UpdateCoordinateInputControls();
 }
 
-std::optional<CapturedImage> CaptureMapRegion(HWND targetWindow, std::wstring& error)
+void ClearCoordinateForCapture(bool firstPoint)
 {
-    // The coordinate labels are inside the centered map panel. Keep this
-    // broad enough for resizing while excluding the top-left app overlay.
-    auto region = CaptureClientRegion(
-        targetWindow,
-        0.20,
-        0.08,
-        0.80,
-        0.92,
-        error);
-    if (!region.has_value())
+    if (g_app == nullptr)
     {
-        return std::nullopt;
+        return;
     }
 
-    return std::move(region->image);
-}
-
-enum class OcrImageMode
-{
-    Original,
-    BrightTextThreshold,
-    DarkTextThreshold,
-    LocalDarkTextThreshold,
-};
-
-CapturedImage PrepareOcrImage(
-    const CapturedImage& source,
-    OcrImageMode mode,
-    int scale,
-    bool blackForeground)
-{
-    CapturedImage prepared;
-    prepared.width = source.width * scale;
-    prepared.height = source.height * scale;
-    prepared.stride = prepared.width * 4;
-    prepared.pixels.resize(static_cast<size_t>(prepared.stride) * prepared.height);
-
-    std::vector<std::uint8_t> luminances;
-    std::vector<int> integral;
-    if (mode == OcrImageMode::LocalDarkTextThreshold)
+    if (firstPoint)
     {
-        luminances.resize(static_cast<size_t>(source.width) * source.height);
-        integral.resize(
-            static_cast<size_t>(source.width + 1) * (source.height + 1),
-            0);
-
-        for (int sourceY = 0; sourceY < source.height; ++sourceY)
-        {
-            int rowSum = 0;
-            for (int sourceX = 0; sourceX < source.width; ++sourceX)
-            {
-                const auto* sourcePixel = source.pixels.data() +
-                    (static_cast<size_t>(sourceY) * source.stride) +
-                    (static_cast<size_t>(sourceX) * 4);
-                const int luminance =
-                    (sourcePixel[2] * 299 + sourcePixel[1] * 587 + sourcePixel[0] * 114) /
-                    1000;
-                luminances[
-                    static_cast<size_t>(sourceY) * source.width + sourceX] =
-                    static_cast<std::uint8_t>(luminance);
-                rowSum += luminance;
-                integral[
-                    static_cast<size_t>(sourceY + 1) * (source.width + 1) + sourceX + 1] =
-                    integral[
-                        static_cast<size_t>(sourceY) * (source.width + 1) + sourceX + 1] +
-                    rowSum;
-            }
-        }
+        g_app->first.reset();
     }
-
-    for (int y = 0; y < prepared.height; ++y)
+    else
     {
-        const int sourceY = y / scale;
-        for (int x = 0; x < prepared.width; ++x)
-        {
-            const int sourceX = x / scale;
-            const auto* sourcePixel = source.pixels.data() +
-                (static_cast<size_t>(sourceY) * source.stride) +
-                (static_cast<size_t>(sourceX) * 4);
-            auto* destinationPixel = prepared.pixels.data() +
-                (static_cast<size_t>(y) * prepared.stride) +
-                (static_cast<size_t>(x) * 4);
-
-            if (mode != OcrImageMode::Original)
-            {
-                const int luminance = luminances.empty()
-                    ? (sourcePixel[2] * 299 + sourcePixel[1] * 587 + sourcePixel[0] * 114) /
-                          1000
-                    : luminances[
-                          static_cast<size_t>(sourceY) * source.width + sourceX];
-                bool foreground = false;
-                if (mode == OcrImageMode::BrightTextThreshold)
-                {
-                    foreground = luminance >= 180;
-                }
-                else if (mode == OcrImageMode::DarkTextThreshold)
-                {
-                    foreground = luminance <= 105;
-                }
-                else
-                {
-                    constexpr int kLocalRadius = 7;
-                    constexpr int kDarkTextMargin = 18;
-                    const int left = std::max(0, sourceX - kLocalRadius);
-                    const int top = std::max(0, sourceY - kLocalRadius);
-                    const int right = std::min(source.width - 1, sourceX + kLocalRadius);
-                    const int bottom = std::min(source.height - 1, sourceY + kLocalRadius);
-                    const int area = (right - left + 1) * (bottom - top + 1);
-                    const auto sumAt = [&integral, sourceWidth = source.width](int x, int y)
-                    {
-                        return integral[
-                            static_cast<size_t>(y) * (sourceWidth + 1) + x];
-                    };
-                    const int localSum =
-                        sumAt(right + 1, bottom + 1) -
-                        sumAt(left, bottom + 1) -
-                        sumAt(right + 1, top) +
-                        sumAt(left, top);
-                    const int localMean = area > 0 ? localSum / area : luminance;
-                    foreground = luminance + kDarkTextMargin < localMean;
-                }
-
-                const std::uint8_t value = blackForeground
-                    ? (foreground ? 0 : 255)
-                    : (foreground ? 255 : 0);
-                destinationPixel[0] = value;
-                destinationPixel[1] = value;
-                destinationPixel[2] = value;
-            }
-            else
-            {
-                destinationPixel[0] = sourcePixel[0];
-                destinationPixel[1] = sourcePixel[1];
-                destinationPixel[2] = sourcePixel[2];
-            }
-
-            destinationPixel[3] = 255;
-        }
+        g_app->second.reset();
     }
-
-    return prepared;
-}
-
-winrt::Windows::Graphics::Imaging::SoftwareBitmap MakeSoftwareBitmap(
-    const CapturedImage& image)
-{
-    using namespace winrt::Windows::Graphics::Imaging;
-    using namespace winrt::Windows::Storage::Streams;
-
-    const auto byteCount = static_cast<std::uint32_t>(image.pixels.size());
-    Buffer buffer(byteCount);
-    buffer.Length(byteCount);
-
-    auto byteAccess = buffer.as<winrt::impl::IBufferByteAccess>();
-    std::uint8_t* destination = nullptr;
-    winrt::check_hresult(byteAccess->Buffer(&destination));
-    std::memcpy(destination, image.pixels.data(), image.pixels.size());
-
-    return SoftwareBitmap::CreateCopyFromBuffer(
-        buffer,
-        BitmapPixelFormat::Bgra8,
-        image.width,
-        image.height,
-        BitmapAlphaMode::Ignore);
-}
-
-struct WinrtApartmentGuard
-{
-    bool initialized{false};
-
-    WinrtApartmentGuard()
-    {
-        winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        initialized = true;
-    }
-
-    ~WinrtApartmentGuard()
-    {
-        if (initialized)
-        {
-            winrt::uninit_apartment();
-        }
-    }
-};
-
-OcrRecognition RecognizeImageText(
-    const CapturedImage& image,
-    std::wstring& error)
-{
-    try
-    {
-        WinrtApartmentGuard apartment;
-        auto engine = winrt::Windows::Media::Ocr::OcrEngine::TryCreateFromUserProfileLanguages();
-        if (engine == nullptr)
-        {
-            error = L"Windows OCR is unavailable. Install an OCR language pack in Windows Settings.";
-            return {};
-        }
-
-        OcrRecognition recognition;
-        const auto focusedImage = CropCapturedImage(
-            image,
-            0.30,
-            0.26,
-            0.72,
-            0.70);
-
-        const auto recognizePass =
-            [&engine, &recognition](
-                const CapturedImage& source,
-                OcrImageMode mode,
-                bool focused)
-        {
-            const CapturedImage prepared = PrepareOcrImage(
-                source,
-                mode,
-                static_cast<int>(kOcrScale),
-                false);
-            const auto bitmap = MakeSoftwareBitmap(prepared);
-            const auto result = engine.RecognizeAsync(bitmap).get();
-            const std::wstring recognized = result.Text().c_str();
-
-            if (!recognition.combinedText.empty() && !recognized.empty())
-            {
-                recognition.combinedText += L"\n";
-            }
-            recognition.combinedText += recognized;
-            recognition.passes.push_back(OcrTextPass{recognized, focused});
-        };
-
-        // The coordinate labels are small and often sit over textured map
-        // imagery. A center-focused pass gives Windows OCR enough scale and
-        // context to retain both decimal digits. Keep the broad passes too,
-        // because a marked point may be away from the exact map center.
-        for (const OcrImageMode mode : {
-                 OcrImageMode::Original,
-                 OcrImageMode::BrightTextThreshold,
-                 OcrImageMode::DarkTextThreshold,
-                 OcrImageMode::LocalDarkTextThreshold})
-        {
-            recognizePass(focusedImage, mode, true);
-        }
-
-        for (const OcrImageMode mode : {
-                 // Keep the unmodified map first within the broad passes.
-                 // Thresholded passes are useful fallbacks, but can distort
-                 // small decimal glyphs.
-                 OcrImageMode::Original,
-                 OcrImageMode::BrightTextThreshold,
-                 OcrImageMode::DarkTextThreshold,
-                 OcrImageMode::LocalDarkTextThreshold})
-        {
-            recognizePass(image, mode, false);
-        }
-
-        error = L"OCR completed, but no x###.## and y###.## coordinate pair was found.";
-        return recognition;
-    }
-    catch (const winrt::hresult_error& exception)
-    {
-        error = L"Windows OCR failed: ";
-        error += exception.message().c_str();
-    }
-    catch (const std::exception& exception)
-    {
-        error = L"OCR failed: ";
-        const std::string message = exception.what();
-        error += std::wstring(message.begin(), message.end());
-    }
-
-    return {};
+    RecalculateSolution();
+    UpdateCoordinateInputControls();
+    UpdateDisplay();
 }
 
 void ApplyCapturedCoordinate(bool firstPoint, const Coordinate& coordinate)
@@ -1973,35 +1499,28 @@ void ApplyCapturedCoordinate(bool firstPoint, const Coordinate& coordinate)
     if (firstPoint)
     {
         g_app->first = coordinate;
-        g_app->second.reset();
-        g_app->distance.reset();
-        g_app->bearing.reset();
-        g_app->compassDirection.clear();
-        SetStatus(L"Captured the player's position. Capture or enter the target position.");
-        UpdateCoordinateInputControls();
     }
     else
     {
-        if (!g_app->first.has_value())
-        {
-            SetStatus(L"Capture or enter the player's position first.");
-            MessageBeep(MB_ICONWARNING);
-            return;
-        }
-
         g_app->second = coordinate;
-        const double dx = coordinate.x - g_app->first->x;
-        const double dy = coordinate.y - g_app->first->y;
-        g_app->distance = std::hypot(dx, dy);
-        const DirectionResult direction = CalculateDirection(*g_app->first, coordinate);
-        g_app->bearing = direction.bearing;
-        g_app->compassDirection = direction.compass;
-        SetStatus(
-            L"Distance: " + FormatNumber(*g_app->distance, 2) + L" | Direction: " +
-            FormatDirection(direction));
-        UpdateCoordinateInputControls();
     }
 
+    RecalculateSolution();
+    if (g_app->distance.has_value() && g_app->bearing.has_value())
+    {
+        SetStatus(
+            L"Distance: " + FormatNumber(*g_app->distance, 2) + L" | Direction: " +
+            FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection);
+    }
+    else if (firstPoint)
+    {
+        SetStatus(L"Captured the player's position. Capture or enter the target position.");
+    }
+    else
+    {
+        SetStatus(L"Captured the target's position. Capture or enter the player's position.");
+    }
+    UpdateCoordinateInputControls();
     UpdateDisplay();
 }
 
@@ -2039,23 +1558,174 @@ bool BringTargetGameToForeground(std::wstring& error)
     return true;
 }
 
-void StartOcrCapture(bool firstPoint)
+bool SendMouseInput(DWORD flags, LONG dx = 0, LONG dy = 0)
+{
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = dx;
+    input.mi.dy = dy;
+    input.mi.dwFlags = flags;
+    return SendInput(1, &input, sizeof(input)) == 1;
+}
+
+bool SendMouseClick(DWORD buttonDown, DWORD buttonUp)
+{
+    INPUT inputs[2]{};
+    inputs[0].type = INPUT_MOUSE;
+    inputs[0].mi.dwFlags = buttonDown;
+    inputs[1].type = INPUT_MOUSE;
+    inputs[1].mi.dwFlags = buttonUp;
+    return SendInput(_countof(inputs), inputs, sizeof(INPUT)) == _countof(inputs);
+}
+
+bool SendKeyInput(WORD virtualKey, bool down)
+{
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = virtualKey;
+    input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+    return SendInput(1, &input, sizeof(input)) == 1;
+}
+
+bool SendKeyPress(WORD virtualKey)
+{
+    return SendKeyInput(virtualKey, true) && SendKeyInput(virtualKey, false);
+}
+
+bool SendCtrlShortcut(WORD virtualKey)
+{
+    const bool controlDown = SendKeyInput(VK_LCONTROL, true);
+    const bool keyPress = SendKeyPress(virtualKey);
+    const bool controlUp = SendKeyInput(VK_LCONTROL, false);
+    return controlDown && keyPress && controlUp;
+}
+
+struct CursorPositionRestorer
+{
+    POINT position{};
+
+    ~CursorPositionRestorer()
+    {
+        SetCursorPos(position.x, position.y);
+    }
+};
+
+std::optional<std::wstring> RunCoordinateClipboardMacro(
+    std::wstring& error,
+    DWORD stepDelayMs,
+    DWORD clickSettleDelayMs,
+    DWORD clipboardTimeoutMs)
+{
+    POINT initialCursor{};
+    if (!GetCursorPos(&initialCursor))
+    {
+        error = L"Could not read the current mouse position.";
+        return std::nullopt;
+    }
+    CursorPositionRestorer restoreCursor{initialCursor};
+
+    const DWORD initialClipboardSequence = GetClipboardSequenceNumber();
+
+    if (!SendMouseClick(MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP))
+    {
+        error = L"Could not send the right-click input to the game.";
+        return std::nullopt;
+    }
+    Sleep(stepDelayMs);
+
+    if (!SendMouseInput(
+            MOUSEEVENTF_MOVE,
+            kCoordinateMacroMouseOffset,
+            kCoordinateMacroMouseOffset))
+    {
+        error = L"Could not move the mouse for the coordinate capture macro.";
+        return std::nullopt;
+    }
+    Sleep(stepDelayMs);
+
+    if (!SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP))
+    {
+        error = L"Could not send the left-click input to the game.";
+        return std::nullopt;
+    }
+    Sleep(clickSettleDelayMs);
+
+    for (int attempt = 0; attempt < kCoordinateMacroSelectAllAttempts; ++attempt)
+    {
+        if (!SendCtrlShortcut('A'))
+        {
+            error = L"Could not send the coordinate copy keyboard input to the game.";
+            return std::nullopt;
+        }
+        Sleep(stepDelayMs);
+    }
+    if (!SendCtrlShortcut('C'))
+    {
+        error = L"Could not send the coordinate copy keyboard input to the game.";
+        return std::nullopt;
+    }
+    Sleep(stepDelayMs);
+
+    const ULONGLONG deadline =
+        GetTickCount64() + clipboardTimeoutMs;
+    bool clipboardChanged = false;
+    if (initialClipboardSequence == 0)
+    {
+        Sleep(stepDelayMs * 2);
+        clipboardChanged = true;
+    }
+    while (!clipboardChanged && GetTickCount64() < deadline)
+    {
+        clipboardChanged = GetClipboardSequenceNumber() != initialClipboardSequence;
+        if (!clipboardChanged)
+        {
+            Sleep(10);
+        }
+    }
+
+    if (!SendKeyPress(VK_BACK))
+    {
+        error = L"Could not finish the coordinate capture macro.";
+        return std::nullopt;
+    }
+    Sleep(stepDelayMs);
+
+    // This is the final input event in the macro; cursor restoration happens
+    // afterward as cleanup.
+    if (!SendMouseClick(MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP))
+    {
+        error = L"Could not finish the coordinate capture macro.";
+        return std::nullopt;
+    }
+    Sleep(stepDelayMs);
+
+    if (!clipboardChanged)
+    {
+        error = L"The game did not copy coordinates to the clipboard.";
+        return std::nullopt;
+    }
+
+    const auto text = GetClipboardText();
+    if (!text.has_value())
+    {
+        error = L"The coordinate clipboard text could not be read.";
+        return std::nullopt;
+    }
+
+    return text;
+}
+
+void StartCoordinateCapture(bool firstPoint)
 {
     if (g_app == nullptr)
     {
         return;
     }
 
-    if (g_app->ocrInProgress.exchange(true))
-    {
-        SetStatus(L"An OCR capture is already in progress.");
-        return;
-    }
-
+    ClearCoordinateForCapture(firstPoint);
     RefreshTargetGame();
     if (g_app->targetWindow == nullptr || !IsWindow(g_app->targetWindow))
     {
-        g_app->ocrInProgress = false;
         SetStatus(L"WardogsClient-Win64-Shipping.exe is not running or has no visible window.");
         MessageBeep(MB_ICONWARNING);
         return;
@@ -2064,7 +1734,6 @@ void StartOcrCapture(bool firstPoint)
     std::wstring focusError;
     if (!BringTargetGameToForeground(focusError))
     {
-        g_app->ocrInProgress = false;
         SetStatus(focusError);
         MessageBeep(MB_ICONWARNING);
         return;
@@ -2084,14 +1753,50 @@ void StartOcrCapture(bool firstPoint)
         ShowWindow(g_app->rangeOverlayWindow, SW_HIDE);
     }
 
-    // The guides are layered windows. Give DWM a chance to commit their
-    // hidden state before BitBlt reads the desktop, otherwise one frame of a
-    // red guide can remain over a coordinate glyph and change its OCR.
     DwmFlush();
-    Sleep(50);
+    Sleep(kCoordinateMacroStepDelayMs);
 
-    std::wstring captureError;
-    const auto captured = CaptureMapRegion(g_app->targetWindow, captureError);
+    std::wstring macroError;
+    std::optional<Coordinate> coordinate;
+    for (int attempt = 0; attempt < kCoordinateMacroMaxAttempts; ++attempt)
+    {
+        const bool retry = attempt > 0;
+        if (retry)
+        {
+            SetStatus(
+                firstPoint
+                    ? L"Player coordinates were not detected. Retrying with longer waits..."
+                    : L"Target coordinates were not detected. Retrying with longer waits...");
+        }
+        else
+        {
+            SetStatus(firstPoint ? L"Running the player coordinate macro..."
+                                 : L"Running the target coordinate macro...");
+        }
+
+        const auto clipboardText = RunCoordinateClipboardMacro(
+            macroError,
+            retry ? kCoordinateMacroRetryStepDelayMs
+                  : kCoordinateMacroStepDelayMs,
+            retry ? kCoordinateMacroRetryClickSettleDelayMs
+                  : kCoordinateMacroClickSettleDelayMs,
+            retry ? kCoordinateMacroRetryClipboardTimeoutMs
+                  : kCoordinateMacroClipboardTimeoutMs);
+        if (!clipboardText.has_value())
+        {
+            continue;
+        }
+
+        const auto parsedCoordinate = ParseCoordinateText(*clipboardText);
+        if (parsedCoordinate.has_value())
+        {
+            coordinate = parsedCoordinate;
+            break;
+        }
+
+        macroError =
+            L"The game copied text, but it did not contain a valid X/Y coordinate pair.";
+    }
 
     if (infoOverlayWasVisible)
     {
@@ -2103,86 +1808,18 @@ void StartOcrCapture(bool firstPoint)
     }
     UpdateOverlay();
 
-    if (!captured.has_value())
+    if (!coordinate.has_value())
     {
-        g_app->ocrInProgress = false;
-        SetStatus(captureError);
-        MessageBeep(MB_ICONWARNING);
-        return;
-    }
-
-    const HWND mainWindow = g_app->mainWindow;
-    SetStatus(firstPoint ? L"Reading the player's position from the game map..."
-                         : L"Reading the target position from the game map...");
-
-    std::thread(
-        [mainWindow, firstPoint, image = std::move(*captured)]() mutable
+        if (macroError.empty())
         {
-            auto* result = new OcrResult();
-            result->firstPoint = firstPoint;
-            const auto recognition = RecognizeImageText(image, result->error);
-            result->recognizedText = recognition.combinedText;
-            result->ocrPasses = recognition.passes;
-
-            if (!result->ocrPasses.empty())
-            {
-                const auto coordinate = SelectOcrCoordinate(result->ocrPasses);
-                if (coordinate.has_value())
-                {
-                    result->coordinate = *coordinate;
-                    result->coordinateFound = true;
-                }
-            }
-
-            if (!PostMessageW(
-                    mainWindow,
-                    kOcrResultMessage,
-                    0,
-                    reinterpret_cast<LPARAM>(result)))
-            {
-                delete result;
-            }
-        })
-        .detach();
-}
-
-void HandleOcrResult(OcrResult* result)
-{
-    std::unique_ptr<OcrResult> ownedResult(result);
-    if (g_app == nullptr || result == nullptr)
-    {
-        return;
-    }
-
-    g_app->ocrInProgress = false;
-    if (!result->coordinateFound)
-    {
-        std::wstring message = result->error.empty()
-            ? L"OCR did not find a valid coordinate pair. Open the game map and try again."
-            : result->error;
-        if (!result->recognizedText.empty())
-        {
-            std::wstring preview = result->recognizedText;
-            for (wchar_t& character : preview)
-            {
-                if (character == L'\r' || character == L'\n' || character == L'\t')
-                {
-                    character = L' ';
-                }
-            }
-            if (preview.size() > 100)
-            {
-                preview.resize(97);
-                preview += L"...";
-            }
-            message += L" Read: " + preview;
+            macroError = L"The coordinate macro did not return valid coordinates.";
         }
-        SetStatus(message);
+        SetStatus(macroError);
         MessageBeep(MB_ICONWARNING);
         return;
     }
 
-    ApplyCapturedCoordinate(result->firstPoint, result->coordinate);
+    ApplyCapturedCoordinate(firstPoint, *coordinate);
 }
 
 void CopyDistance()
@@ -2274,7 +1911,7 @@ void ApplyClipboardCoordinate(bool firstPoint)
         return;
     }
 
-    const auto coordinate = ParseOcrCoordinate(*text);
+    const auto coordinate = ParseCoordinateText(*text);
     if (!coordinate.has_value())
     {
         SetStatus(L"Clipboard text did not contain a valid X/Y coordinate pair.");
@@ -3530,6 +3167,12 @@ std::wstring RangeValue()
     return value ? FormatNumber(*value, 1) + L" m" : L"\u2014 m";
 }
 
+bool IsRangeTooFar()
+{
+    const auto value = CurrentRangeTargetMeters();
+    return value.has_value() && *value > kMaximumRangeMeters;
+}
+
 std::wstring BearingValue()
 {
     return g_app->bearing ? FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection : L"\u2014";
@@ -3655,13 +3298,17 @@ void PaintMain(HDC dc)
     UiText(dc, L"RANGE", {18, 63, 182, 82}, 10, kMuted, FW_SEMIBOLD);
     UiText(dc, L"BEARING", {200, 63, 366, 82}, 10, kMuted, FW_SEMIBOLD);
     UiText(dc, RangeValue(), {16, 83, 190, 131}, 34, kText, FW_SEMIBOLD);
+    if (IsRangeTooFar())
+    {
+        UiText(dc, L"Too Far", {16, 130, 190, 153}, 13, kCoral, FW_SEMIBOLD);
+    }
     UiText(dc, BearingValue(), {198, 83, 368, 131}, 34, kText, FW_SEMIBOLD);
     for (int i = 0; i < 2; ++i)
     {
         int x = 16 + i * 182;
         const auto point = i == 1 ? g_app->second : g_app->first;
         UiText(dc, i == 1 ? L"TARGET" : L"PLAYER", {x, 157, x+170, 175}, 10, kMuted);
-        UiText(dc, point ? FormatCoordinate(*point) : L"Not captured", {x, 178, x+170, 204}, 14);
+        UiText(dc, DisplayCoordinate(point), {x, 178, x+170, 204}, 14);
     }
 
     UiText(dc, L"MANUAL / CLIPBOARD", {18, 214, 382, 233}, 10, kMuted, FW_SEMIBOLD);
@@ -3685,11 +3332,15 @@ void PaintOverlay(HWND window, HDC dc)
     const int w = client.right;
     UiText(dc, L"Arty Buddy", {16, 10, w-16, 32}, 13, kText, FW_SEMIBOLD);
     UiText(dc, RangeValue(), {16, 37, w/2, 82}, 30, kText, FW_SEMIBOLD);
+    if (IsRangeTooFar())
+    {
+        UiText(dc, L"Too Far!", {16, 76, w/2, 92}, 11, kCoral, FW_SEMIBOLD);
+    }
     UiText(dc, BearingValue(), {w/2+8, 37, w-16, 82}, 30, kText, FW_SEMIBOLD);
     UiText(dc, L"PLAYER", {16, 91, w/2, 107}, 10, kMuted);
     UiText(dc, L"TARGET", {w/2+8, 91, w-16, 107}, 10, kMuted);
-    UiText(dc, g_app->first ? FormatCoordinate(*g_app->first) : L"Not captured", {16, 108, w/2, 130}, 12);
-    UiText(dc, g_app->second ? FormatCoordinate(*g_app->second) : L"Not captured", {w/2+8, 108, w-16, 130}, 12);
+    UiText(dc, DisplayCoordinate(g_app->first), {16, 108, w/2, 130}, 12);
+    UiText(dc, DisplayCoordinate(g_app->second), {w/2+8, 108, w-16, 130}, 12);
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -3773,17 +3424,23 @@ void PaintRangeOverlay(HWND window, HDC dc)
                 markerTop,
                 height - 1);
 
-            HPEN anglePen = CreatePen(
-                PS_SOLID,
-                kOverlayGuidePenWidth,
-                RGB(255, 55, 55));
-            HPEN previousPen = static_cast<HPEN>(SelectObject(dc, anglePen));
-            MoveToEx(dc, guideX, markerTop, nullptr);
-            LineTo(dc, guideX, markerBottom);
-            SelectObject(dc, previousPen);
-            DeleteObject(anglePen);
+            const bool rangeTooFar = IsRangeTooFar();
+            if (!rangeTooFar)
+            {
+                HPEN anglePen = CreatePen(
+                    PS_SOLID,
+                    kOverlayGuidePenWidth,
+                    RGB(255, 55, 55));
+                HPEN previousPen = static_cast<HPEN>(SelectObject(dc, anglePen));
+                MoveToEx(dc, guideX, markerTop, nullptr);
+                LineTo(dc, guideX, markerBottom);
+                SelectObject(dc, previousPen);
+                DeleteObject(anglePen);
+            }
 
-            const std::wstring label = FormatNumber(*reference, 0);
+            const std::wstring label = rangeTooFar
+                ? L"TOO FAR!"
+                : FormatNumber(*reference, 0);
             HFONT font = CreateFontW(
                 24,
                 0,
@@ -4018,9 +3675,6 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             }
         }
         break;
-    case kOcrResultMessage:
-        HandleOcrResult(reinterpret_cast<OcrResult*>(lParam));
-        return 0;
     case kUpdateCheckMessage:
         HandleUpdateCheckResult(reinterpret_cast<UpdateCheckResult*>(lParam));
         return 0;
@@ -4052,10 +3706,10 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             ShowSettingsPage(false);
             return 0;
         case kCommandCaptureFirst:
-            StartOcrCapture(true);
+            StartCoordinateCapture(true);
             return 0;
         case kCommandCaptureSecond:
-            StartOcrCapture(false);
+            StartCoordinateCapture(false);
             return 0;
         case kCommandApplyPlayer:
             ApplyManualCoordinate(true);
@@ -4108,10 +3762,10 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         switch (wParam)
         {
         case kHotkeyFirst:
-            StartOcrCapture(true);
+            StartCoordinateCapture(true);
             return 0;
         case kHotkeySecond:
-            StartOcrCapture(false);
+            StartCoordinateCapture(false);
             return 0;
         case kHotkeyToggleOverlay:
             ToggleOverlay();
