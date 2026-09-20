@@ -47,7 +47,7 @@ The horizontal traverse ladder is handled the same way, using the circular refer
 
 The default shortcuts are `Ctrl+Alt+1`, `Ctrl+Alt+2`, `Ctrl+Alt+O`, `Ctrl+Alt+T`, and `Ctrl+Alt+C`. Open the settings page with the cog button to assign any shortcut, including Ctrl, Alt, Shift, and Win modifiers. Click a shortcut button, then press the desired key combination.
 
-The settings page also includes automatic updates, enabled by default. When enabled, Arty Buddy checks the latest stable GitHub release at startup and asks whether to download and install a newer Windows executable. The updater downloads over HTTPS, uses the bundled `ArtyBuddyUpdater.exe` helper to replace the executable after Arty Buddy exits, and restarts the app. The **Exit on close** setting is off by default; when enabled, closing the main Arty Buddy window exits the process instead of leaving it in the tray.
+The settings page also includes automatic updates, enabled by default. When enabled, Arty Buddy checks the latest stable GitHub release at startup and asks whether to download and install a newer Windows executable. The update downloads over HTTPS, then uses a temporary hidden Windows PowerShell script to replace the executable after Arty Buddy exits and restart the app. The **Exit on close** setting is off by default; when enabled, closing the main Arty Buddy window exits the process instead of leaving it in the tray.
 
 Right-click the tray icon for the context menu. It includes an explicit **Exit** command; double-clicking the icon reopens the main window.
 
@@ -55,7 +55,7 @@ The application uses a normal topmost layered window that tracks the main window
 
 ## Build
 
-The project uses CMake and MSVC. The Release configuration statically links the Microsoft C/C++ runtime. The application needs `WarDogsArtillery.exe` and the bundled `ArtyBuddyUpdater.exe` helper at runtime; X/Y capture uses the Windows input and clipboard APIs, and RNG guidance uses the built-in step table.
+The project uses CMake and MSVC. The Release configuration statically links the Microsoft C/C++ runtime. The application is self-contained as `WarDogsArtillery.exe`; X/Y capture uses the Windows input and clipboard APIs, and RNG guidance uses the built-in step table.
 
 ```powershell
 cmake -S . -B build -A x64

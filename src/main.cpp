@@ -59,7 +59,7 @@ constexpr UINT kGamePollIntervalMs = 250;
 constexpr UINT kUpdateCheckMessage = WM_APP + 3;
 constexpr UINT kUpdateDownloadMessage = WM_APP + 4;
 constexpr wchar_t kTargetProcessName[] = L"WardogsClient-Win64-Shipping.exe";
-constexpr wchar_t kCurrentVersion[] = L"0.0.4";
+constexpr wchar_t kCurrentVersion[] = L"0.0.05";
 constexpr wchar_t kLatestReleaseApiUrl[] =
     L"https://api.github.com/repos/kramerology/WardogsArtilleryBuddy/releases/latest";
 
@@ -2409,6 +2409,30 @@ bool WriteBinaryFile(
     return succeeded;
 }
 
+bool WriteUtf16TextFile(
+    const std::wstring& path,
+    const std::wstring& text,
+    std::wstring& error)
+{
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(2 + text.size() * sizeof(wchar_t));
+    bytes.push_back(0xff);
+    bytes.push_back(0xfe);
+    for (const wchar_t character : text)
+    {
+        const auto value = static_cast<std::uint16_t>(character);
+        bytes.push_back(static_cast<std::uint8_t>(value & 0xff));
+        bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xff));
+    }
+
+    if (!WriteBinaryFile(path, bytes, error))
+    {
+        error = L"Could not create the temporary update script.";
+        return false;
+    }
+    return true;
+}
+
 bool DownloadUpdate(
     const std::wstring& url,
     const std::wstring& path,
@@ -2536,6 +2560,24 @@ std::wstring QuoteCommandLineArgument(const std::wstring& value)
     return L"\"" + value + L"\"";
 }
 
+std::wstring QuotePowerShellString(const std::wstring& value)
+{
+    std::wstring result = L"'";
+    for (const wchar_t character : value)
+    {
+        if (character == L'\'')
+        {
+            result += L"''";
+        }
+        else
+        {
+            result += character;
+        }
+    }
+    result += L"'";
+    return result;
+}
+
 std::optional<std::wstring> CurrentExecutablePath()
 {
     std::vector<wchar_t> buffer(MAX_PATH);
@@ -2571,20 +2613,63 @@ bool LaunchPendingUpdate(const std::wstring& tempPath)
         return false;
     }
     const std::wstring directory = executablePath->substr(0, separator);
-    const std::wstring updaterPath = directory + L"\\ArtyBuddyUpdater.exe";
-    if (GetFileAttributesW(updaterPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    const auto scriptPath = CreateUpdateTempPath();
+    if (!scriptPath.has_value())
     {
         return false;
     }
 
+    const std::wstring script =
+        L"$ErrorActionPreference = 'Stop'\r\n"
+        L"$source = " + QuotePowerShellString(tempPath) + L"\r\n"
+        L"$target = " + QuotePowerShellString(*executablePath) + L"\r\n"
+        L"$parent = Get-Process -Id " +
+            std::to_wstring(GetCurrentProcessId()) +
+            L" -ErrorAction SilentlyContinue\r\n"
+        L"if ($null -ne $parent) { [void]$parent.WaitForExit(30000) }\r\n"
+        L"for ($attempt = 0; $attempt -lt 120; $attempt++) {\r\n"
+        L"    try {\r\n"
+        L"        Move-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop\r\n"
+        L"        Start-Process -FilePath $target -ErrorAction Stop\r\n"
+        L"        Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\r\n"
+        L"        exit 0\r\n"
+        L"    } catch {\r\n"
+        L"        Start-Sleep -Milliseconds 250\r\n"
+        L"    }\r\n"
+        L"}\r\n"
+        L"Remove-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue\r\n"
+        L"Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue\r\n";
+    std::wstring scriptError;
+    if (!WriteUtf16TextFile(*scriptPath, script, scriptError))
+    {
+        DeleteFileW(scriptPath->c_str());
+        return false;
+    }
+
+    wchar_t systemDirectory[MAX_PATH]{};
+    const UINT systemDirectoryLength = GetSystemDirectoryW(
+        systemDirectory,
+        _countof(systemDirectory));
+    if (systemDirectoryLength == 0 ||
+        systemDirectoryLength >= _countof(systemDirectory))
+    {
+        DeleteFileW(scriptPath->c_str());
+        return false;
+    }
+    const std::wstring powershellPath =
+        std::wstring(systemDirectory, systemDirectoryLength) +
+        L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    if (GetFileAttributesW(powershellPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        DeleteFileW(scriptPath->c_str());
+        return false;
+    }
+
     std::wstring commandLine =
-        QuoteCommandLineArgument(updaterPath) +
-        L" --apply-update " +
-        QuoteCommandLineArgument(tempPath) +
-        L" " +
-        QuoteCommandLineArgument(*executablePath) +
-        L" " +
-        std::to_wstring(GetCurrentProcessId());
+        QuoteCommandLineArgument(powershellPath) +
+        L" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass"
+        L" -WindowStyle Hidden -File " +
+        QuoteCommandLineArgument(*scriptPath);
     std::vector<wchar_t> mutableCommandLine(
         commandLine.begin(),
         commandLine.end());
@@ -2596,7 +2681,7 @@ bool LaunchPendingUpdate(const std::wstring& tempPath)
     startup.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(
-            updaterPath.c_str(),
+            powershellPath.c_str(),
             mutableCommandLine.data(),
             nullptr,
             nullptr,
@@ -2607,6 +2692,7 @@ bool LaunchPendingUpdate(const std::wstring& tempPath)
             &startup,
             &process))
     {
+        DeleteFileW(scriptPath->c_str());
         return false;
     }
 
