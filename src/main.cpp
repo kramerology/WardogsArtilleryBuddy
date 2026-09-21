@@ -9,6 +9,7 @@
 #endif
 
 #include <windows.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <dwmapi.h>
@@ -59,26 +60,24 @@ constexpr UINT kGamePollIntervalMs = 250;
 constexpr UINT kUpdateCheckMessage = WM_APP + 3;
 constexpr UINT kUpdateDownloadMessage = WM_APP + 4;
 constexpr wchar_t kTargetProcessName[] = L"WardogsClient-Win64-Shipping.exe";
-constexpr wchar_t kCurrentVersion[] = L"0.0.05";
+constexpr wchar_t kCurrentVersion[] = L"0.0.06";
 constexpr wchar_t kLatestReleaseApiUrl[] =
     L"https://api.github.com/repos/kramerology/WardogsArtilleryBuddy/releases/latest";
+constexpr int kMainWindowWidth = 340;
+constexpr int kMainWindowHeight = 374;
+constexpr int kSettingsWindowHeight = 380;
+constexpr int kMainContentRight = 324;
+constexpr int kMainSecondColumnX = 166;
+constexpr int kMainColumnWidth = 150;
 
 constexpr int kHotkeyFirst = 1;
 constexpr int kHotkeySecond = 2;
 constexpr int kHotkeyToggleOverlay = 3;
-constexpr int kHotkeyCopyDistance = 4;
-constexpr int kHotkeyToggleClickThrough = 5;
 
-constexpr int kCommandCaptureFirst = 1001;
-constexpr int kCommandCaptureSecond = 1002;
 constexpr int kCommandToggleOverlay = 1003;
-constexpr int kCommandCopyDistance = 1004;
-constexpr int kCommandToggleClickThrough = 1005;
 constexpr int kCommandExit = 1006;
 constexpr int kCommandSettings = 1007;
 constexpr int kCommandSettingsBack = 1008;
-constexpr int kCommandApplyPlayer = 1009;
-constexpr int kCommandApplyTarget = 1010;
 constexpr int kCommandPastePlayer = 1011;
 constexpr int kCommandPasteTarget = 1012;
 constexpr int kCommandToggleAutoUpdate = 1013;
@@ -88,7 +87,7 @@ constexpr int kControlPlayerX = 1201;
 constexpr int kControlPlayerY = 1202;
 constexpr int kControlTargetX = 1203;
 constexpr int kControlTargetY = 1204;
-constexpr size_t kHotkeyCount = 5;
+constexpr size_t kHotkeyCount = 3;
 
 constexpr wchar_t kSettingsRegistryPath[] = L"Software\\ArtyBuddy";
 constexpr wchar_t kAutoUpdateRegistryName[] = L"AutoUpdateEnabled";
@@ -100,10 +99,6 @@ constexpr const wchar_t* kHotkeyRegistryNames[] = {
     L"CaptureTargetKey",
     L"ToggleOverlayModifiers",
     L"ToggleOverlayKey",
-    L"CopyDistanceModifiers",
-    L"CopyDistanceKey",
-    L"ToggleClickThroughModifiers",
-    L"ToggleClickThroughKey",
 };
 
 constexpr double kDefaultMetersPerCoordinateUnit = 100.0;
@@ -203,7 +198,6 @@ struct AppState
 
     bool overlayEnabled{true};
     bool overlayVisible{false};
-    bool clickThrough{true};
     bool autoUpdateEnabled{true};
     bool exitOnMainWindowClose{false};
     bool closing{false};
@@ -213,14 +207,13 @@ struct AppState
     HotkeyBinding hotkeyCaptureOriginal{};
     std::array<HotkeyBinding, kHotkeyCount> hotkeys{};
     std::array<HWND, kHotkeyCount> hotkeyControls{};
+    bool syncingCoordinateInputs{false};
     HWND playerXEdit{};
     HWND playerYEdit{};
     HWND targetXEdit{};
     HWND targetYEdit{};
     HWND settingsButton{};
     HWND settingsBackButton{};
-    HWND applyPlayerButton{};
-    HWND applyTargetButton{};
     HWND pastePlayerButton{};
     HWND pasteTargetButton{};
     HWND autoUpdateButton{};
@@ -240,8 +233,6 @@ std::array<HotkeyBinding, kHotkeyCount> DefaultHotkeyBindings()
         HotkeyBinding{MOD_CONTROL | MOD_ALT, '1'},
         HotkeyBinding{MOD_CONTROL | MOD_ALT, '2'},
         HotkeyBinding{MOD_CONTROL | MOD_ALT, 'O'},
-        HotkeyBinding{MOD_CONTROL | MOD_ALT, 'C'},
-        HotkeyBinding{MOD_CONTROL | MOD_ALT, 'T'},
     };
 }
 
@@ -467,7 +458,7 @@ std::wstring FormatHotkey(const HotkeyBinding& binding)
 
 std::wstring FormatCoordinate(const Coordinate& coordinate)
 {
-    return L"X: " + FormatNumber(coordinate.x, 3) + L"    Y: " +
+    return L"X: " + FormatNumber(coordinate.x, 3) + L"  Y: " +
            FormatNumber(coordinate.y, 3);
 }
 
@@ -489,11 +480,12 @@ void SetCoordinateEditValue(HWND edit, const std::optional<double>& value)
 
 void UpdateCoordinateInputControls()
 {
-    if (g_app == nullptr)
+    if (g_app == nullptr || g_app->syncingCoordinateInputs)
     {
         return;
     }
 
+    g_app->syncingCoordinateInputs = true;
     SetCoordinateEditValue(
         g_app->playerXEdit,
         g_app->first.has_value()
@@ -514,6 +506,7 @@ void UpdateCoordinateInputControls()
         g_app->second.has_value()
             ? std::optional<double>(g_app->second->y)
             : std::nullopt);
+    g_app->syncingCoordinateInputs = false;
 }
 
 double NormalizeAngleDegrees(double angle)
@@ -1104,8 +1097,7 @@ std::wstring OverlayStateText()
         state = L"waiting for the game window";
     }
 
-    return L"Overlay: " + state + L" | Click-through: " +
-           (g_app->clickThrough ? L"on" : L"off");
+    return L"Overlay: " + state;
 }
 
 void UpdateOverlay()
@@ -1219,8 +1211,6 @@ void UpdateDisplay()
 
     UpdateOverlay();
     InvalidateRect(g_app->mainWindow, nullptr, FALSE);
-    InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleOverlay), nullptr, TRUE);
-    InvalidateRect(GetDlgItem(g_app->mainWindow, kCommandToggleClickThrough), nullptr, TRUE);
     if (g_app->settingsButton != nullptr)
     {
         InvalidateRect(g_app->settingsButton, nullptr, TRUE);
@@ -1822,27 +1812,6 @@ void StartCoordinateCapture(bool firstPoint)
     ApplyCapturedCoordinate(firstPoint, *coordinate);
 }
 
-void CopyDistance()
-{
-    if (g_app == nullptr || !g_app->distance.has_value())
-    {
-        SetStatus(L"There is no calculated distance to copy yet.");
-        MessageBeep(MB_ICONWARNING);
-        return;
-    }
-
-    const std::wstring result = FormatNumber(*g_app->distance, 2);
-    if (SetClipboardText(result))
-    {
-        SetStatus(L"Copied distance " + result + L" to the clipboard.");
-    }
-    else
-    {
-        SetStatus(L"Could not write the distance to the clipboard.");
-        MessageBeep(MB_ICONWARNING);
-    }
-}
-
 std::wstring ReadEditText(HWND edit)
 {
     if (edit == nullptr)
@@ -1880,7 +1849,7 @@ std::optional<double> ParseManualCoordinateValue(const std::wstring& text)
     }
 }
 
-void ApplyManualCoordinate(bool firstPoint)
+void UpdateManualCoordinateFromEdits(bool firstPoint)
 {
     if (g_app == nullptr)
     {
@@ -1891,14 +1860,48 @@ void ApplyManualCoordinate(bool firstPoint)
     const HWND yEdit = firstPoint ? g_app->playerYEdit : g_app->targetYEdit;
     const auto x = ParseManualCoordinateValue(ReadEditText(xEdit));
     const auto y = ParseManualCoordinateValue(ReadEditText(yEdit));
-    if (!x.has_value() || !y.has_value())
+
+    if (x.has_value() && y.has_value())
     {
-        SetStatus(L"Enter valid numeric X and Y coordinates.");
-        MessageBeep(MB_ICONWARNING);
-        return;
+        const Coordinate coordinate{*x, *y};
+        if (firstPoint)
+        {
+            g_app->first = coordinate;
+        }
+        else
+        {
+            g_app->second = coordinate;
+        }
+    }
+    else if (firstPoint)
+    {
+        g_app->first.reset();
+    }
+    else
+    {
+        g_app->second.reset();
     }
 
-    ApplyCapturedCoordinate(firstPoint, Coordinate{*x, *y});
+    RecalculateSolution();
+    if (x.has_value() && y.has_value())
+    {
+        if (g_app->distance.has_value() && g_app->bearing.has_value())
+        {
+            SetStatus(
+                L"Distance: " + FormatNumber(*g_app->distance, 2) +
+                L" | Direction: " + FormatNumber(*g_app->bearing, 0) +
+                L"\u00b0 " + g_app->compassDirection);
+        }
+        else if (firstPoint)
+        {
+            SetStatus(L"Captured the player's position. Capture or enter the target position.");
+        }
+        else
+        {
+            SetStatus(L"Captured the target's position. Capture or enter the player's position.");
+        }
+    }
+    UpdateDisplay();
 }
 
 void ApplyClipboardCoordinate(bool firstPoint)
@@ -2783,15 +2786,7 @@ void ApplyOverlayHitTesting()
 
     LONG_PTR style = GetWindowLongPtrW(g_app->overlayWindow, GWL_EXSTYLE);
     style |= WS_EX_NOACTIVATE;
-
-    if (g_app->clickThrough)
-    {
-        style |= WS_EX_TRANSPARENT;
-    }
-    else
-    {
-        style &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
-    }
+    style |= WS_EX_TRANSPARENT;
 
     SetWindowLongPtrW(g_app->overlayWindow, GWL_EXSTYLE, style);
     SetWindowPos(
@@ -2817,21 +2812,6 @@ void ToggleOverlay()
             ? L"Overlay enabled; it will appear whenever the game is running."
             : L"Overlay disabled by setting.");
     RefreshTargetGame();
-    UpdateDisplay();
-}
-
-void ToggleClickThrough()
-{
-    if (g_app == nullptr)
-    {
-        return;
-    }
-
-    g_app->clickThrough = !g_app->clickThrough;
-    ApplyOverlayHitTesting();
-    SetStatus(
-        g_app->clickThrough ? L"Overlay is now click-through."
-                            : L"Overlay now accepts mouse input.");
     UpdateDisplay();
 }
 
@@ -2929,12 +2909,7 @@ void ShowTrayMenu(HWND owner)
         return;
     }
 
-    AppendMenuW(menu, MF_STRING, kCommandCaptureFirst, L"Capture first coordinate");
-    AppendMenuW(menu, MF_STRING, kCommandCaptureSecond, L"Capture second coordinate");
-    AppendMenuW(menu, MF_STRING, kCommandCopyDistance, L"Copy distance");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCommandToggleOverlay, L"Enable/disable overlay");
-    AppendMenuW(menu, MF_STRING, kCommandToggleClickThrough, L"Toggle click-through");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kCommandExit, L"Exit");
 
@@ -2980,8 +2955,6 @@ void UnregisterGlobalHotkeys(HWND window)
     UnregisterHotKey(window, kHotkeyFirst);
     UnregisterHotKey(window, kHotkeySecond);
     UnregisterHotKey(window, kHotkeyToggleOverlay);
-    UnregisterHotKey(window, kHotkeyCopyDistance);
-    UnregisterHotKey(window, kHotkeyToggleClickThrough);
     if (g_app != nullptr)
     {
         g_app->hotkeysRegistered = false;
@@ -2992,8 +2965,6 @@ constexpr const wchar_t* kHotkeyActionLabels[] = {
     L"Capture player",
     L"Capture target",
     L"Toggle overlay",
-    L"Copy distance",
-    L"Click-through",
 };
 
 bool IsHotkeyModifierKey(UINT virtualKey)
@@ -3150,15 +3121,16 @@ void ShowSettingsPage(bool show)
     }
 
     g_app->settingsVisible = show;
+    SetWindowPos(
+        g_app->mainWindow,
+        nullptr,
+        0,
+        0,
+        kMainWindowWidth,
+        show ? kSettingsWindowHeight : kMainWindowHeight,
+        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     const int mainControlIds[] = {
-        kCommandCaptureFirst,
-        kCommandCaptureSecond,
-        kCommandToggleOverlay,
-        kCommandToggleClickThrough,
-        kCommandCopyDistance,
-        kCommandApplyPlayer,
-        kCommandApplyTarget,
         kCommandPastePlayer,
         kCommandPasteTarget,
     };
@@ -3234,6 +3206,25 @@ void UiText(HDC dc, const std::wstring& text, RECT rect, int size = 14,
     DeleteObject(font);
 }
 
+void UiIcon(HDC dc, const std::wstring& text, RECT rect, int size = 16,
+            COLORREF color = kText, int weight = FW_NORMAL)
+{
+    HFONT font = CreateFontW(-size, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
+    auto old = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    DrawTextW(
+        dc,
+        text.c_str(),
+        -1,
+        &rect,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    SelectObject(dc, old);
+    DeleteObject(font);
+}
+
 void Card(HDC dc, RECT rect, COLORREF fill = kSurface, COLORREF edge = kBorder, int radius = 12)
 {
     HBRUSH brush = CreateSolidBrush(fill);
@@ -3250,7 +3241,7 @@ void Card(HDC dc, RECT rect, COLORREF fill = kSurface, COLORREF edge = kBorder, 
 std::wstring RangeValue()
 {
     auto value = CurrentRangeTargetMeters();
-    return value ? FormatNumber(*value, 1) + L" m" : L"\u2014 m";
+    return value ? FormatNumber(*value, 1) + L" m" : L"- m";
 }
 
 bool IsRangeTooFar()
@@ -3261,7 +3252,64 @@ bool IsRangeTooFar()
 
 std::wstring BearingValue()
 {
-    return g_app->bearing ? FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection : L"\u2014";
+    return g_app != nullptr && g_app->bearing.has_value()
+        ? FormatNumber(*g_app->bearing, 0) + L"\u00b0 " + g_app->compassDirection
+        : L"-";
+}
+
+constexpr UINT_PTR kCoordinateEditSubclassId = 1;
+
+LRESULT CALLBACK CoordinateEditSubclassProc(
+    HWND window,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam,
+    UINT_PTR subclassId,
+    DWORD_PTR /*refData*/)
+{
+    switch (message)
+    {
+    case WM_NCPAINT:
+    {
+        const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        HDC dc = GetWindowDC(window);
+        if (dc != nullptr)
+        {
+            RECT rect{};
+            GetWindowRect(window, &rect);
+            OffsetRect(&rect, -rect.left, -rect.top);
+            HPEN pen = CreatePen(
+                PS_SOLID,
+                1,
+                GetFocus() == window ? kMint : kBorder);
+            HGDIOBJ oldPen = SelectObject(dc, pen);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+            DeleteObject(pen);
+            ReleaseDC(window, dc);
+        }
+        return result;
+    }
+
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    {
+        const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        RedrawWindow(window, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+        return result;
+    }
+
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, CoordinateEditSubclassProc, subclassId);
+        break;
+
+    default:
+        break;
+    }
+
+    return DefSubclassProc(window, message, wParam, lParam);
 }
 
 void CreateMainControls(HWND window)
@@ -3278,10 +3326,10 @@ void CreateMainControls(HWND window)
     };
     auto edit = [&](int id, int x, int y, int w, int h) -> HWND {
         HWND control = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             L"EDIT",
             L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
             x,
             y,
             w,
@@ -3291,25 +3339,19 @@ void CreateMainControls(HWND window)
             g_app->instance,
             nullptr);
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_app->uiFont), TRUE);
+        SendMessageW(control, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELONG(8, 8));
+        SetWindowSubclass(control, CoordinateEditSubclassProc, kCoordinateEditSubclassId, 0);
         return control;
     };
-    g_app->settingsButton = button(kCommandSettings, L"\u2699", 344, 8, 40, 34);
+    g_app->settingsButton = button(kCommandSettings, L"\u2699", 276, 8, 40, 34);
     g_app->settingsBackButton = button(kCommandSettingsBack, L"Back", 16, 8, 52, 34);
 
-    g_app->playerXEdit = edit(kControlPlayerX, 30, 258, 70, 28);
-    g_app->playerYEdit = edit(kControlPlayerY, 126, 258, 70, 28);
-    g_app->targetXEdit = edit(kControlTargetX, 30, 322, 70, 28);
-    g_app->targetYEdit = edit(kControlTargetY, 126, 322, 70, 28);
-    g_app->pastePlayerButton = button(kCommandPastePlayer, L"Paste", 206, 256, 80, 32);
-    g_app->applyPlayerButton = button(kCommandApplyPlayer, L"Apply", 294, 256, 84, 32);
-    g_app->pasteTargetButton = button(kCommandPasteTarget, L"Paste", 206, 320, 80, 32);
-    g_app->applyTargetButton = button(kCommandApplyTarget, L"Apply", 294, 320, 84, 32);
-
-    button(kCommandCaptureFirst, L"Capture player", 16, 370, 170, 36);
-    button(kCommandCaptureSecond, L"Capture target", 198, 370, 170, 36);
-    button(kCommandToggleOverlay, L"Overlay", 16, 428, 100, 32);
-    button(kCommandToggleClickThrough, L"Click-through", 124, 428, 142, 32);
-    button(kCommandCopyDistance, L"Copy distance", 16, 468, 352, 32);
+    g_app->playerXEdit = edit(kControlPlayerX, 30, 210, 70, 28);
+    g_app->playerYEdit = edit(kControlPlayerY, 126, 210, 70, 28);
+    g_app->targetXEdit = edit(kControlTargetX, 30, 274, 70, 28);
+    g_app->targetYEdit = edit(kControlTargetY, 126, 274, 70, 28);
+    g_app->pastePlayerButton = button(kCommandPastePlayer, L"\uE77F", 206, 208, 48, 32);
+    g_app->pasteTargetButton = button(kCommandPasteTarget, L"\uE77F", 206, 272, 48, 32);
 
     for (size_t index = 0; index < kHotkeyCount; ++index)
     {
@@ -3317,24 +3359,24 @@ void CreateMainControls(HWND window)
         g_app->hotkeyControls[index] = button(
             kCommandHotkeyBase + static_cast<int>(index),
             label.c_str(),
-            190,
+            160,
             76 + static_cast<int>(index) * 48,
-            178,
+            148,
             32);
     }
     g_app->autoUpdateButton = button(
         kCommandToggleAutoUpdate,
         L"Auto-update",
-        190,
-        316,
-        178,
+        160,
+        228,
+        148,
         32);
     g_app->exitOnCloseButton = button(
         kCommandToggleExitOnClose,
         L"Exit on close",
-        190,
-        364,
-        178,
+        160,
+        276,
+        148,
         32);
 
     UpdateCoordinateInputControls();
@@ -3347,23 +3389,28 @@ void CreateMainControls(HWND window)
 
 void PaintSettings(HDC dc)
 {
-    UiText(dc, L"Settings", {82, 12, 330, 43}, 21, kText, FW_SEMIBOLD);
-    UiText(dc, L"Keyboard shortcuts", {18, 55, 368, 76}, 11, kMuted, FW_SEMIBOLD);
-    UiText(dc, L"Automatic updates", {18, 316, 180, 348}, 12, kText);
-    UiText(dc, L"Exit when window closes", {18, 364, 180, 396}, 12, kText);
-    UiText(dc, L"Click a shortcut, then press the key combination to assign it.",
-        {18, 412, 382, 436}, 11, kMuted);
-    UiText(dc, L"Automatic updates check GitHub for a newer stable release at startup.",
-        {18, 438, 382, 462}, 11, kMuted);
-    UiText(dc, L"When exit-on-close is off, closing this window keeps Arty Buddy in the tray.",
-        {18, 464, 382, 488}, 11, kMuted);
+    UiText(
+        dc,
+        L"Settings",
+        {0, 12, kMainWindowWidth, 43},
+        21,
+        kText,
+        FW_SEMIBOLD,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    UiText(dc, L"Keyboard shortcuts", {18, 55, 306, 76}, 11, kMuted, FW_SEMIBOLD);
+    HBRUSH divider = CreateSolidBrush(kBorder);
+    RECT dividerRect{18, 216, kMainWindowWidth - 18, 217};
+    FillRect(dc, &dividerRect, divider);
+    DeleteObject(divider);
+    UiText(dc, L"Automatic updates", {18, 228, 180, 260}, 12, kText);
+    UiText(dc, L"Exit when window closes", {18, 276, 180, 308}, 12, kText);
     for (size_t index = 0; index < kHotkeyCount; ++index)
     {
         const int top = 76 + static_cast<int>(index) * 48;
         UiText(
             dc,
             kHotkeyActionLabels[index],
-            {18, top, 180, top + 32},
+            {18, top, 150, top + 32},
             12,
             kText,
             FW_NORMAL,
@@ -3379,34 +3426,32 @@ void PaintMain(HDC dc)
         return;
     }
 
-    UiText(dc, L"\u2295", {16, 13, 47, 48}, 30, kMint);
-    UiText(dc, L"Arty Buddy", {55, 14, 300, 47}, 21, kText, FW_SEMIBOLD);
-    UiText(dc, L"RANGE", {18, 63, 182, 82}, 10, kMuted, FW_SEMIBOLD);
-    UiText(dc, L"BEARING", {200, 63, 366, 82}, 10, kMuted, FW_SEMIBOLD);
-    UiText(dc, RangeValue(), {16, 83, 190, 131}, 34, kText, FW_SEMIBOLD);
+    UiText(dc, L"RANGE", {18, 15, 158, 34}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"BEARING", {174, 15, kMainContentRight, 34}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, RangeValue(), {16, 35, 158, 83}, 34, kText, FW_SEMIBOLD);
     if (IsRangeTooFar())
     {
-        UiText(dc, L"Too Far", {16, 130, 190, 153}, 13, kCoral, FW_SEMIBOLD);
+        UiText(dc, L"Too Far", {16, 82, 158, 105}, 13, kCoral, FW_SEMIBOLD);
     }
-    UiText(dc, BearingValue(), {198, 83, 368, 131}, 34, kText, FW_SEMIBOLD);
+    UiText(dc, BearingValue(), {kMainSecondColumnX, 35, kMainContentRight, 83}, 34, kText, FW_SEMIBOLD);
     for (int i = 0; i < 2; ++i)
     {
-        int x = 16 + i * 182;
+        const int x = 16 + i * kMainColumnWidth;
         const auto point = i == 1 ? g_app->second : g_app->first;
-        UiText(dc, i == 1 ? L"TARGET" : L"PLAYER", {x, 157, x+170, 175}, 10, kMuted);
-        UiText(dc, DisplayCoordinate(point), {x, 178, x+170, 204}, 14);
+        UiText(dc, i == 1 ? L"TARGET" : L"PLAYER", {x, 109, x + kMainColumnWidth, 127}, 10, kMuted);
+        UiText(dc, DisplayCoordinate(point), {x, 130, x + kMainColumnWidth, 156}, 13);
     }
 
-    UiText(dc, L"MANUAL / CLIPBOARD", {18, 214, 382, 233}, 10, kMuted, FW_SEMIBOLD);
-    UiText(dc, L"PLAYER", {16, 236, 100, 254}, 10, kMuted);
-    UiText(dc, L"X", {16, 258, 29, 286}, 11, kMuted, FW_SEMIBOLD,
+    UiText(dc, L"MANUAL / CLIPBOARD", {18, 166, 306, 185}, 10, kMuted, FW_SEMIBOLD);
+    UiText(dc, L"PLAYER", {16, 188, 100, 206}, 10, kMuted);
+    UiText(dc, L"X", {16, 210, 29, 238}, 11, kMuted, FW_SEMIBOLD,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    UiText(dc, L"Y", {112, 258, 125, 286}, 11, kMuted, FW_SEMIBOLD,
+    UiText(dc, L"Y", {112, 210, 125, 238}, 11, kMuted, FW_SEMIBOLD,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    UiText(dc, L"TARGET", {16, 300, 100, 318}, 10, kMuted);
-    UiText(dc, L"X", {16, 322, 29, 350}, 11, kMuted, FW_SEMIBOLD,
+    UiText(dc, L"TARGET", {16, 252, 100, 270}, 10, kMuted);
+    UiText(dc, L"X", {16, 274, 29, 302}, 11, kMuted, FW_SEMIBOLD,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    UiText(dc, L"Y", {112, 322, 125, 350}, 11, kMuted, FW_SEMIBOLD,
+    UiText(dc, L"Y", {112, 274, 125, 302}, 11, kMuted, FW_SEMIBOLD,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
@@ -3449,19 +3494,7 @@ LRESULT CALLBACK OverlayWndProc(HWND window, UINT message, WPARAM wParam, LPARAM
         return MA_NOACTIVATE;
 
     case WM_NCHITTEST:
-        if (g_app != nullptr && g_app->clickThrough)
-        {
-            return HTTRANSPARENT;
-        }
-        break;
-
-    case WM_LBUTTONDOWN:
-        if (g_app != nullptr && !g_app->clickThrough)
-        {
-            ReleaseCapture();
-            SendMessageW(window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-        }
-        return 0;
+        return HTTRANSPARENT;
 
     default:
         break;
@@ -3669,8 +3702,7 @@ LRESULT CALLBACK RangeOverlayWndProc(HWND window, UINT message, WPARAM wParam, L
         return MA_NOACTIVATE;
 
     case WM_NCHITTEST:
-        // The guide must never steal game input, even when the information
-        // panel's click-through setting is temporarily disabled.
+        // The guide must never steal game input.
         return HTTRANSPARENT;
 
     default:
@@ -3711,10 +3743,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
         SetDCBrushColor(item->hDC, kBackground);
         FillRect(item->hDC, &item->rcItem, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-        bool primary = item->CtlID == kCommandCaptureFirst ||
-            item->CtlID == kCommandCaptureSecond ||
-            item->CtlID == kCommandApplyPlayer ||
-            item->CtlID == kCommandApplyTarget;
+        bool primary = false;
         const bool settingsControl =
             item->CtlID == kCommandSettings ||
             item->CtlID == kCommandSettingsBack ||
@@ -3734,12 +3763,20 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         GetWindowTextW(item->hwndItem, label, _countof(label));
         std::wstring text = label;
         if (item->CtlID == kCommandToggleOverlay) text += g_app->overlayEnabled ? L"  ON" : L"  OFF";
-        if (item->CtlID == kCommandToggleClickThrough) text += g_app->clickThrough ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleAutoUpdate) text += g_app->autoUpdateEnabled ? L"  ON" : L"  OFF";
         if (item->CtlID == kCommandToggleExitOnClose) text += g_app->exitOnMainWindowClose ? L"  ON" : L"  OFF";
+        const bool pasteButton = item->CtlID == kCommandPastePlayer ||
+            item->CtlID == kCommandPasteTarget;
         const int textSize = item->CtlID == kCommandSettings ? 20 : 12;
-        UiText(item->hDC, text, item->rcItem, textSize, primary ? kBackground : kText,
-            primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (pasteButton)
+        {
+            UiIcon(item->hDC, text, item->rcItem, 16, kText, FW_NORMAL);
+        }
+        else
+        {
+            UiText(item->hDC, text, item->rcItem, textSize, primary ? kBackground : kText,
+                primary ? FW_SEMIBOLD : FW_NORMAL, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
         if (item->itemState & ODS_FOCUS)
         {
             RECT focus = item->rcItem;
@@ -3773,6 +3810,23 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         return 0;
 
     case WM_COMMAND:
+        if (HIWORD(wParam) == EN_CHANGE)
+        {
+            switch (LOWORD(wParam))
+            {
+            case kControlPlayerX:
+            case kControlPlayerY:
+                UpdateManualCoordinateFromEdits(true);
+                return 0;
+            case kControlTargetX:
+            case kControlTargetY:
+                UpdateManualCoordinateFromEdits(false);
+                return 0;
+            default:
+                break;
+            }
+        }
+
         if (LOWORD(wParam) >= kCommandHotkeyBase &&
             LOWORD(wParam) < kCommandHotkeyBase + static_cast<int>(kHotkeyCount) &&
             HIWORD(wParam) == BN_CLICKED)
@@ -3791,18 +3845,6 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         case kCommandSettingsBack:
             ShowSettingsPage(false);
             return 0;
-        case kCommandCaptureFirst:
-            StartCoordinateCapture(true);
-            return 0;
-        case kCommandCaptureSecond:
-            StartCoordinateCapture(false);
-            return 0;
-        case kCommandApplyPlayer:
-            ApplyManualCoordinate(true);
-            return 0;
-        case kCommandApplyTarget:
-            ApplyManualCoordinate(false);
-            return 0;
         case kCommandPastePlayer:
             ApplyClipboardCoordinate(true);
             return 0;
@@ -3811,12 +3853,6 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return 0;
         case kCommandToggleOverlay:
             ToggleOverlay();
-            return 0;
-        case kCommandCopyDistance:
-            CopyDistance();
-            return 0;
-        case kCommandToggleClickThrough:
-            ToggleClickThrough();
             return 0;
         case kCommandToggleAutoUpdate:
             ToggleAutoUpdate();
@@ -3855,12 +3891,6 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return 0;
         case kHotkeyToggleOverlay:
             ToggleOverlay();
-            return 0;
-        case kHotkeyCopyDistance:
-            CopyDistance();
-            return 0;
-        case kHotkeyToggleClickThrough:
-            ToggleClickThrough();
             return 0;
         default:
             break;
@@ -3979,7 +4009,7 @@ bool CreateOverlayWindow()
 {
     const DWORD extendedStyle =
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE |
-        (g_app->clickThrough ? WS_EX_TRANSPARENT : 0);
+        WS_EX_TRANSPARENT;
 
     g_app->overlayWindow = CreateWindowExW(
         extendedStyle,
@@ -4071,12 +4101,12 @@ int APIENTRY wWinMain(
     state.mainWindow = CreateWindowExW(
         0,
         kMainClassName,
-        L"Arty Buddy",
+        L"",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN,
-        (GetSystemMetrics(SM_CXSCREEN) - 400) / 2,
-        (GetSystemMetrics(SM_CYSCREEN) - 560) / 2,
-        400,
-        560,
+        (GetSystemMetrics(SM_CXSCREEN) - kMainWindowWidth) / 2,
+        (GetSystemMetrics(SM_CYSCREEN) - kMainWindowHeight) / 2,
+        kMainWindowWidth,
+        kMainWindowHeight,
         nullptr,
         nullptr,
         instance,

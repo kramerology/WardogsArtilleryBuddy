@@ -5,8 +5,8 @@ A native Windows utility that reads two X/Y coordinates from the Wardogs game ma
 ## Workflow
 
 1. Open the in-game map while `WardogsClient-Win64-Shipping.exe` is running.
-2. Put the mouse over the player position and press the configured player-capture hotkey, click **Capture player**, or enter/paste the player coordinates manually.
-3. Put the mouse over the target position and press the configured target-capture hotkey, click **Capture target**, or enter/paste the target coordinates manually.
+2. Put the mouse over the player position and press the configured player-capture hotkey, or enter/paste the player coordinates manually.
+3. Put the mouse over the target position and press the configured target-capture hotkey, or enter/paste the target coordinates manually.
 5. The calculated distance appears in the utility and in the topmost overlay.
 6. The direction appears as a bearing plus an 8-point compass label, such as `145° SE`.
 7. Keep the scope in RNG mode. The utility chooses the nearest known RNG line and moves a red horizontal guide bar to the exact offset needed for the calculated range.
@@ -26,7 +26,7 @@ Capture hotkeys run a short input macro against the foreground game: right-click
 
 ## Manual and clipboard input
 
-The main window includes separate X and Y fields for the player and target. Enter numeric values and click **Apply** for either point. The **Paste** buttons read text from the Windows clipboard and accept coordinate formats including `X = 105.59` / `Y = 110.89`, `X: 105.59, Y: 110.89`, and `105.59, 110.89`. Clipboard input is text-based; copying an image does not provide coordinates.
+The main window includes separate X and Y fields for the player and target. Enter numeric values and each point updates automatically once both fields contain valid values. The paste-icon buttons read text from the Windows clipboard and accept coordinate formats including `X = 105.59` / `Y = 110.89`, `X: 105.59, Y: 110.89`, and `105.59, 110.89`. Clipboard input is text-based; copying an image does not provide coordinates.
 
 ## RNG guide
 
@@ -45,13 +45,13 @@ The horizontal traverse ladder is handled the same way, using the circular refer
 
 ## Hotkeys
 
-The default shortcuts are `Ctrl+Alt+1`, `Ctrl+Alt+2`, `Ctrl+Alt+O`, `Ctrl+Alt+T`, and `Ctrl+Alt+C`. Open the settings page with the cog button to assign any shortcut, including Ctrl, Alt, Shift, and Win modifiers. Click a shortcut button, then press the desired key combination.
+The default shortcuts are `Ctrl+Alt+1`, `Ctrl+Alt+2`, and `Ctrl+Alt+O`. Open the settings page with the cog button to assign any shortcut, including Ctrl, Alt, Shift, and Win modifiers. Click a shortcut button, then press the desired key combination.
 
 The settings page also includes automatic updates, enabled by default. When enabled, Arty Buddy checks the latest stable GitHub release at startup and asks whether to download and install a newer Windows executable. The update downloads over HTTPS, then uses a temporary hidden Windows PowerShell script to replace the executable after Arty Buddy exits and restart the app. The **Exit on close** setting is off by default; when enabled, closing the main Arty Buddy window exits the process instead of leaving it in the tray.
 
 Right-click the tray icon for the context menu. It includes an explicit **Exit** command; double-clicking the icon reopens the main window.
 
-The application uses a normal topmost layered window that tracks the main window of `WardogsClient-Win64-Shipping.exe`. It is enabled by default and stays click-through unless toggled. It is shown only while Wardogs is the foreground, non-minimized window; it hides when the game is not running, minimized, or another window is active. It can also be disabled with `Ctrl+Alt+O`. It does not inject into DirectX or into the game process. Borderless-windowed games are generally the most reliable target for this kind of overlay; exclusive fullscreen and anti-cheat software may still hide or block any external window.
+The application uses a normal topmost layered window that tracks the main window of `WardogsClient-Win64-Shipping.exe`. It never takes mouse input from the game. It is shown only while Wardogs is the foreground, non-minimized window; it hides when the game is not running, minimized, or another window is active. It does not inject into DirectX or into the game process. Borderless-windowed games are generally the most reliable target for this kind of overlay; exclusive fullscreen and anti-cheat software may still hide or block any external window.
 
 ## Build
 
